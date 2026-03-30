@@ -1,0 +1,4 @@
+[submodule "inflation"]
+	path = inflation
+	url = https://github.com/PedroLauand/inflation.git
+	branch = main
