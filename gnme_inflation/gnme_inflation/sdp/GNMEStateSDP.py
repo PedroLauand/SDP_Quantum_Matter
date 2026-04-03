@@ -15,10 +15,14 @@ state-SDP:
 
 from __future__ import annotations
 
+import hashlib
+import os
+import pickle
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import combinations, product
+from pathlib import Path
 from time import perf_counter
 from typing import Dict, Iterable, List, Tuple
 
@@ -209,6 +213,62 @@ def quotient_representative_constraints(
     return tuple(kept_constraints)
 
 
+def quotient_ppt_constraints(
+    model: StateSDPDraft,
+    use_source_symmetry: bool = True,
+) -> Tuple[Tuple["PPTVariableDraft", ...], Tuple["PPTConstraintDraft", ...]]:
+    """Remove PPT constraints duplicated by source-variable symmetries.
+
+    If a tau source already lives in the symmetry-invariant subspace, then for a
+    local symmetry permutation ``g`` we have
+
+    ``Gamma_{g(P)}(tau) = Pi_g Gamma_P(tau) Pi_g^T``.
+
+    Positivity is preserved by this permutation congruence, so only one
+    transpose pattern per source-symmetry orbit needs an explicit PPT auxiliary
+    and equality constraint. We keep the raw list when
+    ``use_source_symmetry=False`` because the quotient is only safe once the
+    source symmetry has actually been enforced in the SDP variable.
+    """
+    if not use_source_symmetry:
+        return model.ppt_variables, model.ppt_constraints
+
+    variable_lookup = {variable.name: variable for variable in model.psd_variables}
+    kept_constraints = []
+    kept_variable_names = set()
+    seen = set()
+    for constraint in model.ppt_constraints:
+        source_variable = variable_lookup.get(constraint.source_variable_name)
+        if (
+            source_variable is None
+            or constraint.source_variable_kind != "tau"
+            or not source_variable.local_symmetry_perms
+        ):
+            key = (
+                constraint.source_variable_name,
+                constraint.transpose_positions,
+            )
+        else:
+            key = (
+                constraint.source_variable_name,
+                _canonical_keep_positions_orbit(
+                    constraint.transpose_positions,
+                    source_variable.local_symmetry_perms,
+                ),
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        kept_constraints.append(constraint)
+        kept_variable_names.add(constraint.ppt_variable_name)
+
+    kept_variables = tuple(
+        ppt_variable
+        for ppt_variable in model.ppt_variables
+        if ppt_variable.name in kept_variable_names
+    )
+    return kept_variables, tuple(kept_constraints)
+
 @dataclass(frozen=True)
 class FusionSolveResult:
     """Compact solver summary for the GNME feasibility model."""
@@ -324,6 +384,89 @@ def _progress_stride(total: int) -> int:
     if total <= 100:
         return 10
     return 25
+
+
+_BLUEPRINT_CACHE_VERSION = "gnme_sdp_blueprints_v1"
+
+
+def _blueprint_cache_dir() -> Path:
+    """Directory for persisted GNME blueprint objects.
+
+    Level-3 runs spend substantial time in the inherited nonfanout blueprint
+    generation. Caching the structural blueprint is safe because the object is
+    purely combinatorial and independent of the later MOSEK model.
+    """
+    custom_dir = os.environ.get("GNME_BLUEPRINT_CACHE_DIR")
+    if custom_dir:
+        root = Path(custom_dir).expanduser()
+    else:
+        root = Path.home() / ".cache" / "gnme_inflation"
+    cache_dir = root / _BLUEPRINT_CACHE_VERSION
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _blueprint_cache_path(cache_key: object) -> Path:
+    payload = pickle.dumps((_BLUEPRINT_CACHE_VERSION, cache_key), protocol=5)
+    digest = hashlib.sha256(payload).hexdigest()
+    return _blueprint_cache_dir() / f"{digest}.pkl"
+
+
+def _load_cached_blueprint(cache_key: object):
+    """Load a persisted combinatorial blueprint, if present."""
+    path = _blueprint_cache_path(cache_key)
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+    except Exception:
+        return None
+
+
+def _save_cached_blueprint(cache_key: object, blueprint) -> None:
+    """Persist a combinatorial blueprint for reuse across identical runs."""
+    path = _blueprint_cache_path(cache_key)
+    temp_path = path.with_suffix(".tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            pickle.dump(blueprint, handle, protocol=5)
+        temp_path.replace(path)
+    except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
+def _blueprint_cache_key(
+    problem: GNMEProblem,
+    subset_sizes: Tuple[int, ...],
+    local_dims_per_party: Dict[str, int] | Tuple[int, ...] | int | None,
+) -> Tuple[object, ...]:
+    """Stable cache key for the GNME blueprint request."""
+    if local_dims_per_party is None:
+        normalized_dims = tuple(sorted(problem.local_dimensions_per_party.items()))
+        local_dims_key = None
+    else:
+        normalized_dim_map = problem._normalize_local_dimensions(
+            problem.party_names,
+            local_dims_per_party,
+        )
+        normalized_dims = tuple(sorted(normalized_dim_map.items()))
+        local_dims_key = normalized_dims
+    return (
+        problem.n_parties,
+        problem.inflation_level,
+        tuple(problem.party_names),
+        normalized_dims,
+        tuple(subset_sizes),
+        True,   # include_known_marginals
+        2,      # min_shared_occurrences
+        2,      # min_shared_inflations
+        local_dims_key,
+    )
 
 
 def partial_trace_einsum_spec(
@@ -817,20 +960,31 @@ def build_sdp_draft(
     real_verbose = _resolve_verbose(verbose, getattr(problem, "verbose", 0))
     t0 = perf_counter()
     _progress_log(real_verbose, 1, "Building GNME SDP blueprint...")
-    blueprint = problem.sdp_blueprint(
-        subset_sizes=subset_sizes,
-        include_known_marginals=True,
-        min_shared_occurrences=2,
-        min_shared_inflations=2,
-        local_dims_per_party=local_dims_per_party,
+    blueprint_cache_key = _blueprint_cache_key(
+        problem,
+        subset_sizes,
+        local_dims_per_party,
     )
+    blueprint = _load_cached_blueprint(blueprint_cache_key)
+    blueprint_source = "cache"
+    if blueprint is None:
+        blueprint = problem.sdp_blueprint(
+            subset_sizes=subset_sizes,
+            include_known_marginals=True,
+            min_shared_occurrences=2,
+            min_shared_inflations=2,
+            local_dims_per_party=local_dims_per_party,
+        )
+        _save_cached_blueprint(blueprint_cache_key, blueprint)
+        blueprint_source = "fresh"
     _progress_log(
         real_verbose,
         1,
         "Blueprint ready: "
         f"{len(blueprint.variables)} full inflations, "
         f"{len(blueprint.shared_subset_classes)} shared subset classes "
-        f"in {perf_counter() - t0:.2f}s.",
+        f"in {perf_counter() - t0:.2f}s "
+        f"({blueprint_source}).",
     )
 
     # Step 1: create one full PSD variable per maximal GNME inflation and
@@ -1254,6 +1408,13 @@ def build_legacy_fusion_feasibility_model(
     else:
         model = assigned
         known_values = {}
+    active_ppt_variables = model.ppt_variables
+    active_ppt_constraints = model.ppt_constraints
+    if include_ppt:
+        active_ppt_variables, active_ppt_constraints = quotient_ppt_constraints(
+            model,
+            use_source_symmetry=include_internal_symmetry,
+        )
     real_verbose = _resolve_verbose(verbose, model.verbose)
     total_start = perf_counter()
     _progress_log(real_verbose, 1, "Building MOSEK Fusion feasibility model...")
@@ -1317,7 +1478,7 @@ def build_legacy_fusion_feasibility_model(
                 ppt_variable.name,
                 Domain.inPSDCone(ppt_variable.matrix_dim),
             )
-            for ppt_variable in model.ppt_variables
+            for ppt_variable in active_ppt_variables
         }
         if include_ppt
         else {}
@@ -1538,23 +1699,23 @@ def build_legacy_fusion_feasibility_model(
         _progress_log(
             real_verbose,
             1,
-            f"Fusion step 5/5: adding {len(model.ppt_constraints)} PPT blocks...",
+            f"Fusion step 5/5: adding {len(active_ppt_constraints)} PPT blocks...",
         )
         source_free_variable_lookup = {}
         source_free_variable_lookup.update(tau_variables)
         source_free_variable_lookup.update(auxiliary_variables)
         ppt_constraint_index = 0
-        stride = _progress_stride(len(model.ppt_constraints))
-        for constraint_index, constraint in enumerate(model.ppt_constraints, start=1):
+        stride = _progress_stride(len(active_ppt_constraints))
+        for constraint_index, constraint in enumerate(active_ppt_constraints, start=1):
             if real_verbose >= 2 and (
                 constraint_index == 1
                 or constraint_index % stride == 0
-                or constraint_index == len(model.ppt_constraints)
+                or constraint_index == len(active_ppt_constraints)
             ):
                 _progress_log(
                     real_verbose,
                     2,
-                    f"  PPT block {constraint_index}/{len(model.ppt_constraints)} "
+                    f"  PPT block {constraint_index}/{len(active_ppt_constraints)} "
                     f"for {constraint.source_variable_name}",
                 )
             source_var = source_free_variable_lookup[constraint.source_variable_name]
@@ -1970,6 +2131,7 @@ __all__ = [
     "partial_trace_recipe",
     "print_assigned_values",
     "print_draft",
+    "quotient_ppt_constraints",
     "quotient_representative_constraints",
     "set_values",
     "solve_fusion_feasibility",

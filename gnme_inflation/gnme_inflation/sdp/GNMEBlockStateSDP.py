@@ -53,6 +53,7 @@ from .GNMEStateSDP import (
     _sum_expr,
     _unflatten_index,
     product_dim,
+    quotient_ppt_constraints,
     quotient_representative_constraints,
 )
 
@@ -172,7 +173,11 @@ def _persistent_map_cache_path(cache_key: object) -> Path:
 
 
 def _load_persistent_object(cache_key: object):
-    """Load a raw cached object payload."""
+    """Load a raw cached object payload.
+
+    This helper is shared by map-level and batch-level caches. The payload
+    format is interpreted by the caller so the cache layer can stay generic.
+    """
     path = _persistent_map_cache_path(cache_key)
     if not path.exists():
         return None
@@ -184,7 +189,7 @@ def _load_persistent_object(cache_key: object):
 
 
 def _save_persistent_object(cache_key: object, payload) -> None:
-    """Persist an arbitrary cache payload."""
+    """Persist an arbitrary cache payload atomically when possible."""
     path = _persistent_map_cache_path(cache_key)
     temp_path = path.with_suffix(".tmp")
     try:
@@ -1130,6 +1135,92 @@ def _stack_rhs_blocks(blocks, Expr, Matrix):
     return Expr.vstack(np.asarray(expr_blocks, dtype=object))
 
 
+def _chunk_constraint_blocks(
+    constraints,
+    block_rows_fn,
+    max_blocks_per_chunk: int = 48,
+    max_rows_per_chunk: int = 4096,
+    max_nnz_per_chunk: int = 25_000_000,
+    max_dense_bytes_per_chunk: int = 256_000_000,
+    constraint_nnz_fn=None,
+    constraint_dense_bytes_fn=None,
+):
+    """Split one batch into smaller chunks using output rows and predicted nnz.
+
+    The limits are backend heuristics, not mathematical parameters. The same
+    logic is used for representative and PPT batches.
+    """
+    chunks = []
+    current_chunk = []
+    current_rows = 0
+    current_nnz = 0
+    current_dense_bytes = 0
+
+    for constraint in constraints:
+        block_rows = int(block_rows_fn(constraint))
+        block_nnz = 0 if constraint_nnz_fn is None else int(constraint_nnz_fn(constraint))
+        block_dense_bytes = (
+            0
+            if constraint_dense_bytes_fn is None
+            else int(constraint_dense_bytes_fn(constraint))
+        )
+        would_overflow_rows = current_chunk and (current_rows + block_rows > max_rows_per_chunk)
+        would_overflow_blocks = current_chunk and (len(current_chunk) >= max_blocks_per_chunk)
+        would_overflow_nnz = (
+            current_chunk
+            and constraint_nnz_fn is not None
+            and (current_nnz + block_nnz > max_nnz_per_chunk)
+        )
+        would_overflow_dense_bytes = (
+            current_chunk
+            and constraint_dense_bytes_fn is not None
+            and (current_dense_bytes + block_dense_bytes > max_dense_bytes_per_chunk)
+        )
+        if (
+            would_overflow_rows
+            or would_overflow_blocks
+            or would_overflow_nnz
+            or would_overflow_dense_bytes
+        ):
+            chunks.append(tuple(current_chunk))
+            current_chunk = []
+            current_rows = 0
+            current_nnz = 0
+            current_dense_bytes = 0
+        current_chunk.append(constraint)
+        current_rows += block_rows
+        current_nnz += block_nnz
+        current_dense_bytes += block_dense_bytes
+
+    if current_chunk:
+        chunks.append(tuple(current_chunk))
+
+    return tuple(chunks)
+
+
+def _chunk_representative_constraints(
+    constraints_for_source,
+    representative_coord_dims: Dict[str, int],
+    max_blocks_per_chunk: int = 48,
+    max_rows_per_chunk: int = 4096,
+    max_nnz_per_chunk: int = 25_000_000,
+    max_dense_bytes_per_chunk: int = 256_000_000,
+    constraint_nnz_fn=None,
+    constraint_dense_bytes_fn=None,
+):
+    """Representative-specific wrapper around `_chunk_constraint_blocks`."""
+    return _chunk_constraint_blocks(
+        constraints_for_source,
+        block_rows_fn=lambda constraint: representative_coord_dims[constraint.representative_name],
+        max_blocks_per_chunk=max_blocks_per_chunk,
+        max_rows_per_chunk=max_rows_per_chunk,
+        max_nnz_per_chunk=max_nnz_per_chunk,
+        max_dense_bytes_per_chunk=max_dense_bytes_per_chunk,
+        constraint_nnz_fn=constraint_nnz_fn,
+        constraint_dense_bytes_fn=constraint_dense_bytes_fn,
+    )
+
+
 def _combine_sector_triplets(
     target_coord_dim: int,
     sector_maps,
@@ -1157,7 +1248,6 @@ def _combine_sector_triplets(
         np.concatenate(col_blocks).astype(np.int32, copy=False),
         np.concatenate(val_blocks).astype(np.float64, copy=False),
     )
-
 
 
 def _build_real_symmetric_matrix(
@@ -1420,7 +1510,8 @@ def build_block_fusion_feasibility_model(
     Hermitian: bool = True,
     verbose: int | None = None,
 ):
-    """Instantiate the GNME draft using symmetry-adapted block variables."""
+    """Instantiate the GNME draft using symmetry-adapted block variables.
+    """
     from mosek.fusion import Domain, Expr, Matrix, Model, ObjectiveSense
 
     _warm_numba_selector_kernels()
@@ -1431,6 +1522,14 @@ def build_block_fusion_feasibility_model(
     else:
         model = assigned
         known_values = {}
+
+    active_ppt_variables = model.ppt_variables
+    active_ppt_constraints = model.ppt_constraints
+    if include_ppt:
+        active_ppt_variables, active_ppt_constraints = quotient_ppt_constraints(
+            model,
+            use_source_symmetry=True,
+        )
 
     real_verbose = _resolve_verbose(verbose, model.verbose)
     total_start = perf_counter()
@@ -1443,15 +1542,29 @@ def build_block_fusion_feasibility_model(
         "representative_quotient_time": 0.0,
         "representative_precompile_time": 0.0,
         "representative_batch_assembly_time": 0.0,
+        "representative_batch_mul_time": 0.0,
+        "representative_batch_sub_time": 0.0,
         "representative_batch_triplet_time": 0.0,
+        "representative_batch_matrix_time": 0.0,
         "representative_batch_sparse_time": 0.0,
         "representative_batch_rhs_stack_time": 0.0,
         "representative_constraint_emit_time": 0.0,
         "representative_unique_canonical_maps": 0,
         "representative_source_batches": 0,
+        "representative_chunk_count": 0,
         "representative_batch_memory_hits": 0,
         "representative_batch_disk_hits": 0,
         "representative_batch_misses": 0,
+        "ppt_batch_assembly_time": 0.0,
+        "ppt_batch_mul_time": 0.0,
+        "ppt_batch_sub_time": 0.0,
+        "ppt_batch_triplet_time": 0.0,
+        "ppt_batch_matrix_time": 0.0,
+        "ppt_batch_sparse_time": 0.0,
+        "ppt_batch_rhs_stack_time": 0.0,
+        "ppt_constraint_emit_time": 0.0,
+        "ppt_source_batches": 0,
+        "ppt_chunk_count": 0,
         "ppt_emit_time": 0.0,
         "tau_map_memory_hits": 0,
         "tau_map_disk_hits": 0,
@@ -1466,6 +1579,7 @@ def build_block_fusion_feasibility_model(
     tau_variables = {}
     tau_block_variables = {}
     tau_coordinate_vectors = {}
+    tau_sector_coordinate_vectors = {}
     tau_sector_coordinate_dims = {}
     block_tau_data = {}
     total_block_parameters = 0
@@ -1505,6 +1619,9 @@ def build_block_fusion_feasibility_model(
             tuple(sector.coordinate_vector for sector in sector_block_data),
             Expr,
         )
+        tau_sector_coordinate_vectors[variable.name] = tuple(
+            sector.coordinate_vector for sector in sector_block_data
+        )
         tau_sector_coordinate_dims[variable.name] = tuple(
             sector.coordinate_dim for sector in sector_block_data
         )
@@ -1523,6 +1640,7 @@ def build_block_fusion_feasibility_model(
     step_start = perf_counter()
     auxiliary_variables = {}
     auxiliary_coordinate_vectors = {}
+    representative_coord_dims = {}
     aux_iter = _progress_bar(
         model.auxiliary_representatives,
         real_verbose,
@@ -1545,6 +1663,11 @@ def build_block_fusion_feasibility_model(
             scalar_vars[1],
             Expr,
             Hermitian,
+        )
+        representative_coord_dims[representative.name] = (
+            representative.matrix_dim * representative.matrix_dim
+            if Hermitian
+            else representative.matrix_dim * (representative.matrix_dim + 1) // 2
         )
     known_representative_variables = {}
     known_representative_coordinate_vectors = {}
@@ -1571,14 +1694,28 @@ def build_block_fusion_feasibility_model(
                 Expr,
                 Hermitian,
             )
+        for representative in model.known_representatives:
+            representative_coord_dims[representative.name] = (
+                representative.matrix_dim * representative.matrix_dim
+                if Hermitian
+                else representative.matrix_dim * (representative.matrix_dim + 1) // 2
+            )
+    else:
+        for representative in model.known_representatives:
+            representative_coord_dims[representative.name] = (
+                representative.matrix_dim * representative.matrix_dim
+                if Hermitian
+                else representative.matrix_dim * (representative.matrix_dim + 1) // 2
+            )
     ppt_variables = {}
     ppt_coordinate_vectors = {}
+    ppt_coordinate_dims = {}
     if include_ppt:
         ppt_iter = _progress_bar(
-            model.ppt_variables,
+            active_ppt_variables,
             real_verbose,
             "block step 2: PPT vars",
-            total=len(model.ppt_variables),
+            total=len(active_ppt_variables),
         )
         for ppt_variable in ppt_iter:
             scalar_vars, expr = expression_builder(
@@ -1595,6 +1732,9 @@ def build_block_fusion_feasibility_model(
                 scalar_vars[1],
                 Expr,
                 Hermitian,
+            )
+            ppt_coordinate_dims[ppt_variable.name] = int(
+                ppt_coordinate_vectors[ppt_variable.name].getShape()[0]
             )
     _progress_log(
         real_verbose,
@@ -1613,6 +1753,7 @@ def build_block_fusion_feasibility_model(
     build_profile["auxiliary_declaration_time"] = perf_counter() - step_start
     compiled_linear_maps = {}
     compiled_triplet_maps = {}
+    compiled_sector_triplet_maps = {}
     compiled_batch_triplet_maps = {}
 
     def _canonicalize_source_positions(source_spec, positions, map_kind: str):
@@ -1719,6 +1860,90 @@ def build_block_fusion_feasibility_model(
             build_profile["tau_map_memory_hits"] += 1
         return compiled
 
+    def _compile_canonical_tau_sector_triplets(source_spec, canonical_positions, map_kind: str):
+        """Compile one canonical reduced map while keeping sectors separate."""
+        cache_key = (
+            "sectorwise",
+            map_kind,
+            source_spec.lexorder,
+            source_spec.slot_dims,
+            source_spec.local_symmetry_perms,
+            canonical_positions,
+            Hermitian,
+            tau_sector_coordinate_dims[source_spec.name],
+        )
+        compiled = compiled_sector_triplet_maps.get(cache_key)
+        if compiled is not None:
+            build_profile["tau_map_memory_hits"] += 1
+            return compiled
+
+        persistent_payload = _load_persistent_object(cache_key)
+        if persistent_payload is not None:
+            try:
+                target_coord_dim, sector_payload = persistent_payload
+                compiled = (
+                    int(target_coord_dim),
+                    tuple(
+                        (
+                            np.asarray(rows, dtype=np.int32),
+                            np.asarray(cols, dtype=np.int32),
+                            np.asarray(vals, dtype=np.float64),
+                        )
+                        for rows, cols, vals in sector_payload
+                    ),
+                )
+                compiled_sector_triplet_maps[cache_key] = compiled
+                build_profile["tau_map_disk_hits"] += 1
+                return compiled
+            except Exception:
+                pass
+
+        compile_start = perf_counter()
+        if map_kind == "partial_trace":
+            target_coord_dim, sector_maps = cached_block_partial_trace_coordinate_maps(
+                source_spec.lexorder,
+                source_spec.slot_dims,
+                source_spec.local_symmetry_perms,
+                canonical_positions,
+                Hermitian,
+            )
+        elif map_kind == "partial_transpose":
+            target_coord_dim, sector_maps = cached_block_partial_transpose_coordinate_maps(
+                source_spec.lexorder,
+                source_spec.slot_dims,
+                source_spec.local_symmetry_perms,
+                canonical_positions,
+                Hermitian,
+            )
+        else:
+            raise ValueError(f"Unsupported cached map kind {map_kind!r}.")
+
+        build_profile["tau_map_compile_time"] += perf_counter() - compile_start
+        build_profile["tau_map_misses"] += 1
+        compiled = (
+            int(target_coord_dim),
+            tuple(
+                (
+                    rows.astype(np.int32, copy=False)[order],
+                    cols.astype(np.int32, copy=False)[order],
+                    vals.astype(np.float64, copy=False)[order],
+                )
+                if rows.size
+                else (
+                    rows.astype(np.int32, copy=False),
+                    cols.astype(np.int32, copy=False),
+                    vals.astype(np.float64, copy=False),
+                )
+                for rows, cols, vals in sector_maps
+                for order in (
+                    np.argsort(rows.astype(np.int32, copy=False), kind="mergesort"),
+                )
+            ),
+        )
+        compiled_sector_triplet_maps[cache_key] = compiled
+        _save_persistent_object(cache_key, compiled)
+        return compiled
+
     def get_cached_tau_linear_map_triplets(source_spec, positions, map_kind: str):
         canonical_positions, transport_rows, transport_signs = _canonicalize_source_positions(
             source_spec,
@@ -1751,6 +1976,77 @@ def build_block_fusion_feasibility_model(
         transported = (target_coord_dim, moved_rows, canonical_cols, moved_vals)
         compiled_triplet_maps[transport_key] = transported
         return transported
+
+    def get_cached_tau_sector_linear_map_triplets(source_spec, positions, map_kind: str):
+        """Return reduced tau maps without flattening sectors together."""
+        canonical_positions, transport_rows, transport_signs = _canonicalize_source_positions(
+            source_spec,
+            positions,
+            map_kind,
+        )
+        target_coord_dim, canonical_sector_maps = _compile_canonical_tau_sector_triplets(
+            source_spec,
+            canonical_positions,
+            map_kind,
+        )
+        if transport_rows is None:
+            return target_coord_dim, canonical_sector_maps
+
+        transport_key = (
+            "sectorwise_transported",
+            map_kind,
+            source_spec.name,
+            canonical_positions,
+            positions,
+            Hermitian,
+        )
+        transported = compiled_sector_triplet_maps.get(transport_key)
+        if transported is not None:
+            build_profile["tau_map_memory_hits"] += 1
+            return transported
+
+        transported_sector_maps = []
+        for rows, cols, vals in canonical_sector_maps:
+            moved_rows = transport_rows[rows].astype(np.int32, copy=False)
+            moved_vals = (transport_signs[rows] * vals).astype(np.float64, copy=False)
+            if moved_rows.size:
+                order = np.argsort(moved_rows, kind="mergesort")
+                moved_rows = moved_rows[order]
+                cols = cols[order]
+                moved_vals = moved_vals[order]
+            transported_sector_maps.append((moved_rows, cols, moved_vals))
+        transported = (target_coord_dim, tuple(transported_sector_maps))
+        compiled_sector_triplet_maps[transport_key] = transported
+        return transported
+
+    def get_cached_tau_linear_map_nnz(source_spec, positions, map_kind: str) -> int:
+        """Return the triplet count of a reduced tau linear map.
+
+        The transport action used to move a canonical map to a requested source
+        subset only permutes/sign-flips rows, so the nnz count is inherited
+        from the canonical map. This makes nnz-aware chunking cheap after the
+        canonical maps have been compiled.
+        """
+        canonical_positions, _transport_rows, _transport_signs = _canonicalize_source_positions(
+            source_spec,
+            positions,
+            map_kind,
+        )
+        _target_coord_dim, canonical_rows, _canonical_cols, _canonical_vals = _compile_canonical_tau_triplets(
+            source_spec,
+            canonical_positions,
+            map_kind,
+        )
+        return int(canonical_rows.size)
+
+    def get_cached_tau_sector_linear_map_nnz(source_spec, positions, map_kind: str) -> int:
+        """Triplet count of a reduced tau map with sectors kept separate."""
+        _target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
+            source_spec,
+            positions,
+            map_kind,
+        )
+        return int(sum(rows.size for rows, _cols, _vals in sector_maps))
 
     def get_cached_tau_linear_map(source_spec, positions, map_kind: str):
         sparse_key = (
@@ -1803,6 +2099,14 @@ def build_block_fusion_feasibility_model(
         return compiled_linear_maps[cache_key]
 
     def get_cached_representative_batch_triplets(source_spec, constraints_for_source):
+        """Return one stacked sparse operator for a chunk of representative links.
+
+        Each representative equality contributes a reduced partial-trace map
+        from one source ``tau`` coordinate vector into one target coordinate
+        block. The hot path in level-3 was repeatedly concatenating those
+        blocks, so we cache the fully stacked triplets for each source/chunk
+        signature and reuse them across runs.
+        """
         keep_positions_sequence = tuple(
             tuple(constraint.keep_positions) for constraint in constraints_for_source
         )
@@ -1838,25 +2142,40 @@ def build_block_fusion_feasibility_model(
                 pass
 
         compile_start = perf_counter()
-        row_blocks = []
-        col_blocks = []
-        val_blocks = []
+        triplet_blocks = []
         target_dims = []
         row_offset = 0
+        total_nnz = 0
         for constraint in constraints_for_source:
             target_coord_dim, rows, cols, vals = get_cached_tau_linear_map_triplets(
                 source_spec,
                 constraint.keep_positions,
                 "partial_trace",
             )
-            row_blocks.append((rows + row_offset).astype(np.int32, copy=False))
-            col_blocks.append(cols.astype(np.int32, copy=False))
-            val_blocks.append(vals.astype(np.float64, copy=False))
+            triplet_blocks.append(
+                (
+                    int(row_offset),
+                    rows.astype(np.int32, copy=False),
+                    cols.astype(np.int32, copy=False),
+                    vals.astype(np.float64, copy=False),
+                )
+            )
             target_dims.append(int(target_coord_dim))
+            total_nnz += int(rows.size)
             row_offset += target_coord_dim
-        batch_rows = np.concatenate(row_blocks).astype(np.int32, copy=False)
-        batch_cols = np.concatenate(col_blocks).astype(np.int32, copy=False)
-        batch_vals = np.concatenate(val_blocks).astype(np.float64, copy=False)
+
+        batch_rows = np.empty(total_nnz, dtype=np.int32)
+        batch_cols = np.empty(total_nnz, dtype=np.int32)
+        batch_vals = np.empty(total_nnz, dtype=np.float64)
+        cursor = 0
+        for block_row_offset, rows, cols, vals in triplet_blocks:
+            nnz = int(rows.size)
+            next_cursor = cursor + nnz
+            batch_rows[cursor:next_cursor] = rows + block_row_offset
+            batch_cols[cursor:next_cursor] = cols
+            batch_vals[cursor:next_cursor] = vals
+            cursor = next_cursor
+
         cached_payload = (
             int(row_offset),
             batch_rows,
@@ -1877,6 +2196,185 @@ def build_block_fusion_feasibility_model(
         )
         build_profile["representative_batch_misses"] += 1
         build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
+        return cached_payload
+
+    def get_cached_representative_sector_batch_triplets(source_spec, constraints_for_source):
+        """Return one stacked sparse operator per tau sector for a chunk."""
+        keep_positions_sequence = tuple(
+            tuple(constraint.keep_positions) for constraint in constraints_for_source
+        )
+        cache_key = (
+            "rep_sector_batch_triplets",
+            source_spec.lexorder,
+            source_spec.slot_dims,
+            source_spec.local_symmetry_perms,
+            keep_positions_sequence,
+            Hermitian,
+            tau_sector_coordinate_dims[source_spec.name],
+        )
+        cached_payload = compiled_batch_triplet_maps.get(cache_key)
+        if cached_payload is not None:
+            build_profile["representative_batch_memory_hits"] += 1
+            return cached_payload
+
+        persistent_payload = _load_persistent_object(cache_key)
+        if persistent_payload is not None:
+            try:
+                row_offset, sector_payload, target_dims = persistent_payload
+                cached_payload = (
+                    int(row_offset),
+                    tuple(
+                        (
+                            np.asarray(rows, dtype=np.int32),
+                            np.asarray(cols, dtype=np.int32),
+                            np.asarray(vals, dtype=np.float64),
+                        )
+                        for rows, cols, vals in sector_payload
+                    ),
+                    tuple(int(dim) for dim in target_dims),
+                )
+                compiled_batch_triplet_maps[cache_key] = cached_payload
+                build_profile["representative_batch_disk_hits"] += 1
+                return cached_payload
+            except Exception:
+                pass
+
+        compile_start = perf_counter()
+        sector_triplet_blocks = [[] for _ in tau_sector_coordinate_dims[source_spec.name]]
+        sector_total_nnz = [0 for _ in tau_sector_coordinate_dims[source_spec.name]]
+        target_dims = []
+        row_offset = 0
+        for constraint in constraints_for_source:
+            target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
+                source_spec,
+                constraint.keep_positions,
+                "partial_trace",
+            )
+            for sector_index, (rows, cols, vals) in enumerate(sector_maps):
+                sector_triplet_blocks[sector_index].append(
+                    (
+                        int(row_offset),
+                        rows.astype(np.int32, copy=False),
+                        cols.astype(np.int32, copy=False),
+                        vals.astype(np.float64, copy=False),
+                    )
+                )
+                sector_total_nnz[sector_index] += int(rows.size)
+            target_dims.append(int(target_coord_dim))
+            row_offset += target_coord_dim
+
+        sector_payload = []
+        for triplet_blocks, total_nnz in zip(sector_triplet_blocks, sector_total_nnz):
+            batch_rows = np.empty(total_nnz, dtype=np.int32)
+            batch_cols = np.empty(total_nnz, dtype=np.int32)
+            batch_vals = np.empty(total_nnz, dtype=np.float64)
+            cursor = 0
+            for block_row_offset, rows, cols, vals in triplet_blocks:
+                nnz = int(rows.size)
+                next_cursor = cursor + nnz
+                batch_rows[cursor:next_cursor] = rows + block_row_offset
+                batch_cols[cursor:next_cursor] = cols
+                batch_vals[cursor:next_cursor] = vals
+                cursor = next_cursor
+            sector_payload.append((batch_rows, batch_cols, batch_vals))
+
+        cached_payload = (
+            int(row_offset),
+            tuple(sector_payload),
+            tuple(target_dims),
+        )
+        compiled_batch_triplet_maps[cache_key] = cached_payload
+        _save_persistent_object(cache_key, cached_payload)
+        build_profile["representative_batch_misses"] += 1
+        build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
+        return cached_payload
+
+    def get_cached_ppt_sector_batch_triplets(source_spec, constraints_for_source):
+        """Return one stacked partial-transpose operator per tau sector for a chunk."""
+        transpose_positions_sequence = tuple(
+            tuple(constraint.transpose_positions) for constraint in constraints_for_source
+        )
+        cache_key = (
+            "ppt_sector_batch_triplets",
+            source_spec.lexorder,
+            source_spec.slot_dims,
+            source_spec.local_symmetry_perms,
+            transpose_positions_sequence,
+            Hermitian,
+            tau_sector_coordinate_dims[source_spec.name],
+        )
+        cached_payload = compiled_batch_triplet_maps.get(cache_key)
+        if cached_payload is not None:
+            return cached_payload
+
+        persistent_payload = _load_persistent_object(cache_key)
+        if persistent_payload is not None:
+            try:
+                row_offset, sector_payload, target_dims = persistent_payload
+                cached_payload = (
+                    int(row_offset),
+                    tuple(
+                        (
+                            np.asarray(rows, dtype=np.int32),
+                            np.asarray(cols, dtype=np.int32),
+                            np.asarray(vals, dtype=np.float64),
+                        )
+                        for rows, cols, vals in sector_payload
+                    ),
+                    tuple(int(dim) for dim in target_dims),
+                )
+                compiled_batch_triplet_maps[cache_key] = cached_payload
+                return cached_payload
+            except Exception:
+                pass
+
+        compile_start = perf_counter()
+        sector_triplet_blocks = [[] for _ in tau_sector_coordinate_dims[source_spec.name]]
+        sector_total_nnz = [0 for _ in tau_sector_coordinate_dims[source_spec.name]]
+        target_dims = []
+        row_offset = 0
+        for constraint in constraints_for_source:
+            target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
+                source_spec,
+                constraint.transpose_positions,
+                "partial_transpose",
+            )
+            for sector_index, (rows, cols, vals) in enumerate(sector_maps):
+                sector_triplet_blocks[sector_index].append(
+                    (
+                        int(row_offset),
+                        rows.astype(np.int32, copy=False),
+                        cols.astype(np.int32, copy=False),
+                        vals.astype(np.float64, copy=False),
+                    )
+                )
+                sector_total_nnz[sector_index] += int(rows.size)
+            target_dims.append(int(target_coord_dim))
+            row_offset += target_coord_dim
+
+        sector_payload = []
+        for triplet_blocks, total_nnz in zip(sector_triplet_blocks, sector_total_nnz):
+            batch_rows = np.empty(total_nnz, dtype=np.int32)
+            batch_cols = np.empty(total_nnz, dtype=np.int32)
+            batch_vals = np.empty(total_nnz, dtype=np.float64)
+            cursor = 0
+            for block_row_offset, rows, cols, vals in triplet_blocks:
+                nnz = int(rows.size)
+                next_cursor = cursor + nnz
+                batch_rows[cursor:next_cursor] = rows + block_row_offset
+                batch_cols[cursor:next_cursor] = cols
+                batch_vals[cursor:next_cursor] = vals
+                cursor = next_cursor
+            sector_payload.append((batch_rows, batch_cols, batch_vals))
+
+        cached_payload = (
+            int(row_offset),
+            tuple(sector_payload),
+            tuple(target_dims),
+        )
+        compiled_batch_triplet_maps[cache_key] = cached_payload
+        _save_persistent_object(cache_key, cached_payload)
+        build_profile["ppt_batch_triplet_time"] += perf_counter() - compile_start
         return cached_payload
 
     known_coordinate_values = {}
@@ -2002,7 +2500,7 @@ def build_block_fusion_feasibility_model(
             _local_symmetry_perms,
             canonical_positions,
         ), source_spec in precompile_iter:
-            _compile_canonical_tau_triplets(source_spec, canonical_positions, "partial_trace")
+            _compile_canonical_tau_sector_triplets(source_spec, canonical_positions, "partial_trace")
         build_profile["representative_precompile_time"] = perf_counter() - precompile_start
 
         batch_start = perf_counter()
@@ -2018,51 +2516,71 @@ def build_block_fusion_feasibility_model(
                 _progress_log(
                     real_verbose,
                     2,
-                    f"  representative batch {batch_index}/{len(group_items)} for {source_name} "
-                    f"with {len(constraints_for_source)} blocks",
+                        f"  representative batch {batch_index}/{len(group_items)} for {source_name} "
+                        f"with {len(constraints_for_source)} blocks",
                 )
             source_spec = tau_variable_specs[source_name]
-            source_coord_dim = int(sum(tau_sector_coordinate_dims[source_name]))
-            batch_triplet_start = perf_counter()
-            row_offset, batch_rows, batch_cols, batch_vals, target_dims = get_cached_representative_batch_triplets(
-                source_spec,
+            constraint_chunks = _chunk_representative_constraints(
                 constraints_for_source,
+                representative_coord_dims,
+                constraint_nnz_fn=lambda constraint, _source_spec=source_spec: get_cached_tau_sector_linear_map_nnz(
+                    _source_spec,
+                    constraint.keep_positions,
+                    "partial_trace",
+                ),
             )
-            build_profile["representative_batch_triplet_time"] += perf_counter() - batch_triplet_start
-            rhs_blocks = []
-            for constraint, target_coord_dim in zip(constraints_for_source, target_dims):
-                constraint_counts["representative"] += int(target_coord_dim)
-                if constraint.representative_kind == "known_matrix":
-                    if enforce_known_values:
-                        rhs_blocks.append(known_coordinate_values[constraint.representative_name])
+            build_profile["representative_chunk_count"] += len(constraint_chunks)
+            for chunk_index, constraint_chunk in enumerate(constraint_chunks, start=1):
+                compile_start = perf_counter()
+                row_offset, sector_triplets, target_dims = get_cached_representative_sector_batch_triplets(
+                    source_spec,
+                    constraint_chunk,
+                )
+                build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
+
+                rhs_blocks = []
+                for target_coord_dim, constraint in zip(target_dims, constraint_chunk):
+                    constraint_counts["representative"] += int(target_coord_dim)
+                    if constraint.representative_kind == "known_matrix":
+                        if enforce_known_values:
+                            rhs_blocks.append(known_coordinate_values[constraint.representative_name])
+                        else:
+                            rhs_blocks.append(
+                                known_representative_coordinate_vectors[constraint.representative_name]
+                            )
                     else:
-                        rhs_blocks.append(
-                            known_representative_coordinate_vectors[constraint.representative_name]
-                        )
-                else:
-                    rhs_blocks.append(auxiliary_coordinate_vectors[constraint.representative_name])
-            sparse_start = perf_counter()
-            batch_map = Matrix.sparse(
-                row_offset,
-                source_coord_dim,
-                batch_rows,
-                batch_cols,
-                batch_vals,
-            )
-            sparse_seconds = perf_counter() - sparse_start
-            build_profile["tau_map_sparse_build_time"] += sparse_seconds
-            build_profile["representative_batch_sparse_time"] += sparse_seconds
-            lhs_coord = Expr.mul(batch_map, tau_coordinate_vectors[source_name])
-            rhs_start = perf_counter()
-            rhs_coord = _stack_rhs_blocks(rhs_blocks, Expr, Matrix)
-            build_profile["representative_batch_rhs_stack_time"] += perf_counter() - rhs_start
-            emit_start = perf_counter()
-            M.constraint(
-                f"rep_batch_{batch_index}_{source_name}",
-                Expr.sub(lhs_coord, rhs_coord),
-                Domain.equalsTo(0.0),
-            )
-            build_profile["representative_constraint_emit_time"] += perf_counter() - emit_start
+                        rhs_blocks.append(auxiliary_coordinate_vectors[constraint.representative_name])
+
+                rhs_start = perf_counter()
+                rhs_coord = _stack_rhs_blocks(rhs_blocks, Expr, Matrix)
+                build_profile["representative_batch_rhs_stack_time"] += perf_counter() - rhs_start
+
+                lhs_terms = []
+                for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
+                    zip(sector_triplets, tau_sector_coordinate_dims[source_name])
+                ):
+                    if vals.size == 0:
+                        continue
+                    matrix_start = perf_counter()
+                    batch_map = Matrix.sparse(int(row_offset), int(sector_dim), rows, cols, vals)
+                    build_profile["representative_batch_sparse_time"] += perf_counter() - matrix_start
+                    mul_start = perf_counter()
+                    lhs_terms.append(
+                        Expr.mul(batch_map, tau_sector_coordinate_vectors[source_name][sector_index])
+                    )
+                    build_profile["representative_batch_mul_time"] += perf_counter() - mul_start
+
+                sub_start = perf_counter()
+                difference = Expr.sub(_sum_expr(lhs_terms, Expr), rhs_coord)
+                build_profile["representative_batch_sub_time"] += perf_counter() - sub_start
+
+                emit_start = perf_counter()
+                M.constraint(
+                    f"rep_batch_{batch_index}_{chunk_index}_{source_name}",
+                    difference,
+                    Domain.equalsTo(0.0),
+                )
+                build_profile["representative_constraint_emit_time"] += perf_counter() - emit_start
         build_profile["representative_batch_assembly_time"] = perf_counter() - batch_start
         _progress_log(
             real_verbose,
@@ -2078,58 +2596,127 @@ def build_block_fusion_feasibility_model(
         _progress_log(
             real_verbose,
             1,
-            f"Fusion block step 5/5: adding {len(model.ppt_constraints)} PPT blocks...",
+            f"Fusion block step 5/5: adding {len(active_ppt_constraints)} PPT blocks...",
         )
         tau_variable_specs = {variable.name: variable for variable in model.psd_variables}
         source_free_variable_lookup = {}
         source_free_variable_lookup.update(auxiliary_coordinate_vectors)
         source_free_variable_lookup.update(known_representative_coordinate_vectors)
-        ppt_constraint_index = 0
-        stride = _progress_stride(len(model.ppt_constraints))
-        ppt_constraint_iter = _progress_bar(
-            model.ppt_constraints,
+        grouped_ppt_constraints = defaultdict(list)
+        for constraint in active_ppt_constraints:
+            grouped_ppt_constraints[constraint.source_variable_name].append(constraint)
+        build_profile["ppt_source_batches"] = len(grouped_ppt_constraints)
+
+        ppt_group_items = list(grouped_ppt_constraints.items())
+        ppt_iter = _progress_bar(
+            ppt_group_items,
             real_verbose,
             "block step 5: PPT constraints",
-            total=len(model.ppt_constraints),
+            total=len(ppt_group_items),
         )
-        for constraint_index, constraint in enumerate(ppt_constraint_iter, start=1):
-            if real_verbose >= 2 and (
-                constraint_index == 1
-                or constraint_index % stride == 0
-                or constraint_index == len(model.ppt_constraints)
-            ):
+        for batch_index, (source_name, constraints_for_source) in enumerate(ppt_iter, start=1):
+            source_spec = tau_variable_specs.get(source_name)
+            source_coord = source_free_variable_lookup.get(source_name)
+            if real_verbose >= 2:
                 _progress_log(
                     real_verbose,
                     2,
-                    f"  PPT block {constraint_index}/{len(model.ppt_constraints)} for {constraint.source_variable_name}",
+                    f"  PPT batch {batch_index}/{len(ppt_group_items)} for {source_name} "
+                    f"with {len(constraints_for_source)} blocks",
                 )
-            lhs_coord = ppt_coordinate_vectors[constraint.ppt_variable_name]
-            source_sector_blocks = tau_block_variables.get(constraint.source_variable_name)
-            source_coord = source_free_variable_lookup.get(constraint.source_variable_name)
-            source_spec = tau_variable_specs.get(constraint.source_variable_name)
 
-            if source_sector_blocks is not None and source_spec is not None:
-                target_coord_dim, linear_map = get_cached_tau_linear_map(
-                    source_spec,
-                    constraint.transpose_positions,
-                    "partial_transpose",
+            if source_spec is not None and source_name in tau_sector_coordinate_vectors:
+                constraint_chunks = _chunk_constraint_blocks(
+                    constraints_for_source,
+                    block_rows_fn=lambda constraint: ppt_coordinate_dims[constraint.ppt_variable_name],
+                    constraint_nnz_fn=lambda constraint, _source_spec=source_spec: get_cached_tau_sector_linear_map_nnz(
+                        _source_spec,
+                        constraint.transpose_positions,
+                        "partial_transpose",
+                    ),
                 )
-                rhs_coord = Expr.mul(linear_map, tau_coordinate_vectors[constraint.source_variable_name])
+                build_profile["ppt_chunk_count"] += len(constraint_chunks)
+                for chunk_index, constraint_chunk in enumerate(constraint_chunks, start=1):
+                    compile_start = perf_counter()
+                    row_offset, sector_triplets, target_dims = get_cached_ppt_sector_batch_triplets(
+                        source_spec,
+                        constraint_chunk,
+                    )
+                    build_profile["ppt_batch_triplet_time"] += perf_counter() - compile_start
+
+                    lhs_blocks = []
+                    for target_coord_dim, constraint in zip(target_dims, constraint_chunk):
+                        lhs_blocks.append(ppt_coordinate_vectors[constraint.ppt_variable_name])
+                        constraint_counts["ppt"] += int(target_coord_dim)
+
+                    lhs_start = perf_counter()
+                    lhs_coord = _stack_rhs_blocks(lhs_blocks, Expr, Matrix)
+                    build_profile["ppt_batch_rhs_stack_time"] += perf_counter() - lhs_start
+
+                    rhs_terms = []
+                    for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
+                        zip(sector_triplets, tau_sector_coordinate_dims[source_name])
+                    ):
+                        if vals.size == 0:
+                            continue
+                        matrix_start = perf_counter()
+                        batch_map = Matrix.sparse(int(row_offset), int(sector_dim), rows, cols, vals)
+                        build_profile["ppt_batch_matrix_time"] += perf_counter() - matrix_start
+                        mul_start = perf_counter()
+                        rhs_terms.append(
+                            Expr.mul(batch_map, tau_sector_coordinate_vectors[source_name][sector_index])
+                        )
+                        build_profile["ppt_batch_mul_time"] += perf_counter() - mul_start
+
+                    sub_start = perf_counter()
+                    difference = Expr.sub(lhs_coord, _sum_expr(rhs_terms, Expr))
+                    build_profile["ppt_batch_sub_time"] += perf_counter() - sub_start
+
+                    emit_start = perf_counter()
+                    M.constraint(
+                        f"ppt_batch_{batch_index}_{chunk_index}_{source_name}",
+                        difference,
+                        Domain.equalsTo(0.0),
+                    )
+                    build_profile["ppt_constraint_emit_time"] += perf_counter() - emit_start
             else:
-                target_coord_dim, linear_map = get_cached_free_partial_transpose_map(
-                    constraint.slot_dims,
-                    constraint.transpose_positions,
-                    int(source_coord.getShape()[0]),
+                constraint_chunks = _chunk_constraint_blocks(
+                    constraints_for_source,
+                    block_rows_fn=lambda constraint: ppt_coordinate_dims[constraint.ppt_variable_name],
                 )
-                rhs_coord = Expr.mul(linear_map, source_coord)
+                build_profile["ppt_chunk_count"] += len(constraint_chunks)
+                for chunk_index, constraint_chunk in enumerate(constraint_chunks, start=1):
+                    lhs_blocks = []
+                    rhs_blocks = []
+                    for constraint in constraint_chunk:
+                        lhs_blocks.append(ppt_coordinate_vectors[constraint.ppt_variable_name])
+                        target_coord_dim, linear_map = get_cached_free_partial_transpose_map(
+                            constraint.slot_dims,
+                            constraint.transpose_positions,
+                            int(source_coord.getShape()[0]),
+                        )
+                        mul_start = perf_counter()
+                        rhs_blocks.append(Expr.mul(linear_map, source_coord))
+                        build_profile["ppt_batch_mul_time"] += perf_counter() - mul_start
+                        constraint_counts["ppt"] += int(target_coord_dim)
 
-            ppt_constraint_index += 1
-            constraint_counts["ppt"] += target_coord_dim
-            M.constraint(
-                f"ppt_block_{constraint_index}",
-                Expr.sub(lhs_coord, rhs_coord),
-                Domain.equalsTo(0.0),
-            )
+                    stack_start = perf_counter()
+                    lhs_coord = _stack_rhs_blocks(lhs_blocks, Expr, Matrix)
+                    rhs_coord = _stack_rhs_blocks(rhs_blocks, Expr, Matrix)
+                    build_profile["ppt_batch_rhs_stack_time"] += perf_counter() - stack_start
+
+                    sub_start = perf_counter()
+                    difference = Expr.sub(lhs_coord, rhs_coord)
+                    build_profile["ppt_batch_sub_time"] += perf_counter() - sub_start
+
+                    emit_start = perf_counter()
+                    M.constraint(
+                        f"ppt_batch_{batch_index}_{chunk_index}_{source_name}",
+                        difference,
+                        Domain.equalsTo(0.0),
+                    )
+                    build_profile["ppt_constraint_emit_time"] += perf_counter() - emit_start
+        build_profile["ppt_batch_assembly_time"] = perf_counter() - step_start
         _progress_log(
             real_verbose,
             1,
@@ -2148,13 +2735,24 @@ def build_block_fusion_feasibility_model(
         f"rep precompile={build_profile['representative_precompile_time']:.2f}s, "
         f"rep batch={build_profile['representative_batch_assembly_time']:.2f}s, "
         f"rep batch-triplets={build_profile['representative_batch_triplet_time']:.2f}s, "
-        f"rep batch-sparse={build_profile['representative_batch_sparse_time']:.2f}s, "
+        f"rep batch-matrix={build_profile['representative_batch_matrix_time']:.2f}s, "
+        f"rep batch-mul={build_profile['representative_batch_mul_time']:.2f}s, "
         f"rep rhs-stack={build_profile['representative_batch_rhs_stack_time']:.2f}s, "
+        f"rep batch-sub={build_profile['representative_batch_sub_time']:.2f}s, "
         f"rep emit={build_profile['representative_constraint_emit_time']:.2f}s, "
+        f"rep chunks={build_profile['representative_chunk_count']}, "
         f"rep-batch hits(mem/disk/miss)="
         f"{build_profile['representative_batch_memory_hits']}/"
         f"{build_profile['representative_batch_disk_hits']}/"
         f"{build_profile['representative_batch_misses']}, "
+        f"ppt batch={build_profile['ppt_batch_assembly_time']:.2f}s, "
+        f"ppt batch-triplets={build_profile['ppt_batch_triplet_time']:.2f}s, "
+        f"ppt batch-matrix={build_profile['ppt_batch_matrix_time']:.2f}s, "
+        f"ppt batch-mul={build_profile['ppt_batch_mul_time']:.2f}s, "
+        f"ppt rhs-stack={build_profile['ppt_batch_rhs_stack_time']:.2f}s, "
+        f"ppt batch-sub={build_profile['ppt_batch_sub_time']:.2f}s, "
+        f"ppt emit={build_profile['ppt_constraint_emit_time']:.2f}s, "
+        f"ppt chunks={build_profile['ppt_chunk_count']}, "
         f"tau-map hits(mem/disk/miss)="
         f"{build_profile['tau_map_memory_hits']}/"
         f"{build_profile['tau_map_disk_hits']}/"
