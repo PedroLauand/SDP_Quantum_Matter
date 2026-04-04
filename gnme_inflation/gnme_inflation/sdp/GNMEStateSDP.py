@@ -216,6 +216,7 @@ def quotient_representative_constraints(
 def quotient_ppt_constraints(
     model: StateSDPDraft,
     use_source_symmetry: bool = True,
+    drop_representative_constraints_implied_by_tau: bool = True,
 ) -> Tuple[Tuple["PPTVariableDraft", ...], Tuple["PPTConstraintDraft", ...]]:
     """Remove PPT constraints duplicated by source-variable symmetries.
 
@@ -233,17 +234,96 @@ def quotient_ppt_constraints(
     if not use_source_symmetry:
         return model.ppt_variables, model.ppt_constraints
 
+    source_symmetry_lookup = {
+        variable.name: variable.local_symmetry_perms
+        for variable in model.psd_variables
+    }
+    source_symmetry_lookup.update(
+        {
+            representative.name: representative.local_symmetry_perms
+            for representative in (
+                model.auxiliary_representatives + model.known_representatives
+            )
+        }
+    )
+    representative_lookup = {
+        representative.name: representative
+        for representative in (model.auxiliary_representatives + model.known_representatives)
+    }
+    anchor_constraint_by_representative = {}
+    for constraint in model.representative_constraints:
+        anchor_constraint_by_representative.setdefault(constraint.representative_name, constraint)
+
     variable_lookup = {variable.name: variable for variable in model.psd_variables}
+
+    def _representative_ppt_implied_by_tau(constraint: PPTConstraintDraft) -> bool:
+        representative = representative_lookup.get(constraint.source_variable_name)
+        if representative is None:
+            return False
+        anchor_constraint = anchor_constraint_by_representative.get(representative.name)
+        if anchor_constraint is None:
+            return False
+        source_variable = variable_lookup.get(anchor_constraint.source_variable_name)
+        if source_variable is None or len(source_variable.factorization) <= 1:
+            return False
+
+        source_factor_lookup = {
+            label: factor_index
+            for factor_index, factor in enumerate(source_variable.factorization)
+            for label in factor
+        }
+        representative_factor_positions = factor_positions(
+            representative.target_lexorder,
+            representative.factorization,
+        )
+        transpose_position_set = set(constraint.transpose_positions)
+
+        source_factor_to_representative_factors: Dict[int, List[int]] = {}
+        selected_representative_factors = set()
+        for factor_index, (factor_labels, factor_positions_) in enumerate(
+            zip(representative.factorization, representative_factor_positions)
+        ):
+            source_factor_ids = {source_factor_lookup[label] for label in factor_labels}
+            if len(source_factor_ids) != 1:
+                return False
+            source_factor_id = next(iter(source_factor_ids))
+            source_factor_to_representative_factors.setdefault(source_factor_id, []).append(factor_index)
+
+            selected_positions = [pos in transpose_position_set for pos in factor_positions_]
+            if any(selected_positions):
+                if not all(selected_positions):
+                    return False
+                selected_representative_factors.add(factor_index)
+
+        selected_source_factors = set()
+        for source_factor_id, representative_factor_indices in source_factor_to_representative_factors.items():
+            picked = [
+                factor_index in selected_representative_factors
+                for factor_index in representative_factor_indices
+            ]
+            if any(picked):
+                if not all(picked):
+                    return False
+                selected_source_factors.add(source_factor_id)
+
+        if not selected_source_factors:
+            return False
+        if len(selected_source_factors) == len(source_variable.factorization):
+            return False
+        return True
+
     kept_constraints = []
     kept_variable_names = set()
     seen = set()
     for constraint in model.ppt_constraints:
-        source_variable = variable_lookup.get(constraint.source_variable_name)
         if (
-            source_variable is None
-            or constraint.source_variable_kind != "tau"
-            or not source_variable.local_symmetry_perms
+            drop_representative_constraints_implied_by_tau
+            and constraint.source_variable_kind == "mu"
+            and _representative_ppt_implied_by_tau(constraint)
         ):
+            continue
+        local_symmetry_perms = source_symmetry_lookup.get(constraint.source_variable_name, tuple())
+        if not local_symmetry_perms:
             key = (
                 constraint.source_variable_name,
                 constraint.transpose_positions,
@@ -253,7 +333,7 @@ def quotient_ppt_constraints(
                 constraint.source_variable_name,
                 _canonical_keep_positions_orbit(
                     constraint.transpose_positions,
-                    source_variable.local_symmetry_perms,
+                    local_symmetry_perms,
                 ),
             )
         if key in seen:
@@ -290,6 +370,7 @@ class SharedMarginalRepresentativeDraft:
     target_lexorder: Tuple[str, ...]
     slot_dims: Tuple[int, ...]
     matrix_dim: int
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...]
     factorization: Tuple[Tuple[str, ...], ...]
     kind: str
     is_fixed_known: bool
@@ -1112,6 +1193,9 @@ def build_sdp_draft(
             target_lexorder=representative_occurrence.labels,
             slot_dims=representative_slot_dims,
             matrix_dim=product_dim(representative_slot_dims),
+            local_symmetry_perms=problem.local_symmetry_permutations(
+                representative_occurrence.labels
+            ),
             factorization=representative_occurrence.factorization,
             kind=representative_kind,
             is_fixed_known=representative_occurrence.is_known_marginal,
@@ -1226,6 +1310,9 @@ def build_sdp_draft(
             target_lexorder=representative_occurrence.labels,
             slot_dims=representative_slot_dims,
             matrix_dim=product_dim(representative_slot_dims),
+            local_symmetry_perms=problem.local_symmetry_permutations(
+                representative_occurrence.labels
+            ),
             factorization=representative_occurrence.factorization,
             kind="known_matrix",
             is_fixed_known=True,
@@ -1391,23 +1478,23 @@ def build_legacy_fusion_feasibility_model(
     include_ppt: bool = True,
     include_internal_symmetry: bool = True,
     include_representatives: bool = True,
-    enforce_known_values: bool = True,
+    enforce_known_values: bool = False,
     verbose: int | None = None,
 ):
     """Instantiate the legacy entrywise GNME draft as a MOSEK Fusion model.
 
     The current implementation targets real symmetric state variables. This is
     enough for the GHZ sanity example and keeps the first solver layer close to
-    the draft structure.
+    the draft structure. Known representatives always remain free PSD
+    variables; callers can pin them later with affine constraints.
     """
     from mosek.fusion import Domain, Expr, Matrix, Model, ObjectiveSense
 
     if isinstance(assigned, AssignedStateSDPDraft):
         model = assigned.model
-        known_values = assigned.known_values
     else:
         model = assigned
-        known_values = {}
+    _ = enforce_known_values
     active_ppt_variables = model.ppt_variables
     active_ppt_constraints = model.ppt_constraints
     if include_ppt:
@@ -1461,17 +1548,13 @@ def build_legacy_fusion_feasibility_model(
         )
         for representative in model.auxiliary_representatives
     }
-    known_representative_variables = (
-        {
-            representative.name: M.variable(
-                representative.name,
-                Domain.inPSDCone(representative.matrix_dim),
-            )
-            for representative in model.known_representatives
-        }
-        if not enforce_known_values
-        else {}
-    )
+    known_representative_variables = {
+        representative.name: M.variable(
+            representative.name,
+            Domain.inPSDCone(representative.matrix_dim),
+        )
+        for representative in model.known_representatives
+    }
     ppt_variables = (
         {
             ppt_variable.name: M.variable(
@@ -1522,18 +1605,17 @@ def build_legacy_fusion_feasibility_model(
         )
         constraint_counts["trace"] += 1
 
-    if not enforce_known_values:
-        for representative in model.known_representatives:
-            M.constraint(
-                f"trace_{representative.name}",
-                _trace_expr(
-                    known_representative_variables[representative.name],
-                    representative.matrix_dim,
-                    Expr,
-                ),
-                Domain.equalsTo(1.0),
-            )
-            constraint_counts["trace"] += 1
+    for representative in model.known_representatives:
+        M.constraint(
+            f"trace_{representative.name}",
+            _trace_expr(
+                known_representative_variables[representative.name],
+                representative.matrix_dim,
+                Expr,
+            ),
+            Domain.equalsTo(1.0),
+        )
+        constraint_counts["trace"] += 1
     _progress_log(
         real_verbose,
         1,
@@ -1632,22 +1714,9 @@ def build_legacy_fusion_feasibility_model(
             kept_dims = tuple(source_spec.slot_dims[pos] for pos in constraint.keep_positions)
 
             if constraint.representative_kind == "known_matrix":
-                if enforce_known_values:
-                    known_assignment = known_values[constraint.representative_name]
-                    if np.max(np.abs(np.imag(known_assignment.matrix))) > 1e-9:
-                        raise ValueError(
-                            f"Known matrix {constraint.representative_name} is not real; "
-                            "the current Fusion draft only supports real symmetric data."
-                        )
-                    known_matrix = np.real_if_close(known_assignment.matrix, tol=1e5)
-                    rhs_value = lambda r, c: float(known_matrix[r, c])
-                    rhs_var = None
-                else:
-                    rhs_var = known_representative_variables[constraint.representative_name]
-                    rhs_value = None
+                rhs_var = known_representative_variables[constraint.representative_name]
             else:
                 rhs_var = auxiliary_variables[constraint.representative_name]
-                rhs_value = None
 
             kept_ranges = [range(dim) for dim in kept_dims]
             traced_ranges = [
@@ -1675,7 +1744,7 @@ def build_legacy_fusion_feasibility_model(
                         full_col = _flat_index(tuple(ket_full), source_spec.slot_dims)
                         entry_terms.append(_symmetric_entry(source_var, full_row, full_col))
                     lhs = _sum_expr(entry_terms, Expr)
-                    rhs = rhs_value(row, col) if rhs_var is None else _symmetric_entry(rhs_var, row, col)
+                    rhs = _symmetric_entry(rhs_var, row, col)
                     M.constraint(
                         f"rep_{representative_constraint_index}",
                         Expr.sub(lhs, rhs),
@@ -1772,7 +1841,7 @@ def solve_legacy_fusion_feasibility(
     include_ppt: bool = True,
     include_internal_symmetry: bool = True,
     include_representatives: bool = True,
-    enforce_known_values: bool = True,
+    enforce_known_values: bool = False,
 ) -> FusionSolveResult:
     """Build and solve the legacy entrywise GNME feasibility model.
 
@@ -1840,7 +1909,7 @@ def build_fusion_feasibility_model(
     include_ppt: bool = True,
     include_internal_symmetry: bool = True,
     include_representatives: bool = True,
-    enforce_known_values: bool = True,
+    enforce_known_values: bool = False,
     Hermitian: bool = False,
     verbose: int | None = None,
 ):
@@ -1884,7 +1953,7 @@ def solve_fusion_feasibility(
     include_ppt: bool = True,
     include_internal_symmetry: bool = True,
     include_representatives: bool = True,
-    enforce_known_values: bool = True,
+    enforce_known_values: bool = False,
     Hermitian: bool = False,
 ) -> FusionSolveResult:
     """Build and solve the default GNME Fusion model.

@@ -31,6 +31,7 @@ from functools import lru_cache
 from itertools import product
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -55,6 +56,7 @@ from .GNMEStateSDP import (
     product_dim,
     quotient_ppt_constraints,
     quotient_representative_constraints,
+    symmetric_matrix_orbits,
 )
 
 
@@ -151,7 +153,7 @@ def _progress_bar(iterable, verbose: int, desc: str, total: int | None = None):
     return tqdm(iterable, total=total, desc=desc, leave=False)
 
 
-_MAP_CACHE_VERSION = "gnme_block_maps_v1"
+_MAP_CACHE_VERSION = "gnme_block_maps_v4"
 
 
 def _persistent_map_cache_dir() -> Path:
@@ -256,6 +258,24 @@ def _choose_reference_party_positions(lexorder: Tuple[str, ...]) -> Tuple[int, .
     return tuple(positions_by_party[party])
 
 
+def _party_signature_from_lexorder(lexorder: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Keep only the per-slot party pattern of a lexorder."""
+    return tuple(label.split("_", 1)[0] for label in lexorder)
+
+
+def _layout_signature(
+    lexorder: Tuple[str, ...],
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+) -> Tuple[object, ...]:
+    """Structural signature for one symmetry-adapted tau layout."""
+    return (
+        _party_signature_from_lexorder(lexorder),
+        tuple(int(dim) for dim in slot_dims),
+        tuple(tuple(int(position) for position in permutation) for permutation in local_symmetry_perms),
+    )
+
+
 
 def _small_permutation_from_slots(
     lexorder: Tuple[str, ...],
@@ -291,6 +311,170 @@ def _dense_permutation_matrix(basis_map: Tuple[int, ...]) -> np.ndarray:
     for column, row in enumerate(basis_map):
         matrix[row, column] = 1.0
     return matrix
+
+
+def _permutation_sign(perm: Tuple[int, ...]) -> int:
+    """Parity of a permutation."""
+    inversions = 0
+    for left in range(len(perm)):
+        pivot = perm[left]
+        for right in range(left + 1, len(perm)):
+            if pivot > perm[right]:
+                inversions += 1
+    return -1 if inversions % 2 else 1
+
+
+def _orthonormal_basis_from_projector(projector: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    """Columns spanning the image of a Hermitian projector."""
+    projector = 0.5 * (projector + projector.conj().T)
+    eigenvalues, eigenvectors = np.linalg.eigh(projector)
+    keep = eigenvalues > tol
+    if not np.any(keep):
+        return np.zeros((projector.shape[0], 0), dtype=np.complex128)
+    return np.asarray(eigenvectors[:, keep], dtype=np.complex128)
+
+
+def _exact_c2_sector_basis_from_basis_map(
+    basis_map: Tuple[int, ...],
+) -> Tuple[str, Tuple[Tuple[str, int, int, np.ndarray], ...]]:
+    """Exact sparse sector basis for an involutive permutation action."""
+    dim = len(basis_map)
+    visited = np.zeros(dim, dtype=bool)
+    plus_columns: List[np.ndarray] = []
+    minus_columns: List[np.ndarray] = []
+    inv_sqrt2 = 1.0 / np.sqrt(2.0)
+
+    for index in range(dim):
+        if visited[index]:
+            continue
+        partner = int(basis_map[index])
+        if partner == index:
+            column = np.zeros(dim, dtype=np.complex128)
+            column[index] = 1.0
+            plus_columns.append(column)
+            visited[index] = True
+            continue
+        if int(basis_map[partner]) != index:
+            raise ValueError("C2 basis construction requires an involution.")
+        if partner < index:
+            continue
+        plus = np.zeros(dim, dtype=np.complex128)
+        minus = np.zeros(dim, dtype=np.complex128)
+        plus[index] = inv_sqrt2
+        plus[partner] = inv_sqrt2
+        minus[index] = inv_sqrt2
+        minus[partner] = -inv_sqrt2
+        plus_columns.append(plus)
+        minus_columns.append(minus)
+        visited[index] = True
+        visited[partner] = True
+
+    sectors = []
+    if plus_columns:
+        plus_basis = np.column_stack(plus_columns)
+        sectors.append(("sector_even", 1, plus_basis.shape[1], plus_basis))
+    if minus_columns:
+        minus_basis = np.column_stack(minus_columns)
+        sectors.append(("sector_odd", 1, minus_basis.shape[1], minus_basis))
+    return "exact_c2", tuple(sectors)
+
+
+def _exact_s3_sector_basis_from_pairs(
+    basis_pairs: Tuple[Tuple[Tuple[int, ...], Tuple[int, ...]], ...],
+) -> Tuple[str, Tuple[Tuple[str, int, int, np.ndarray], ...]] | None:
+    """Exact isotypic basis for the full S3 action on three layers."""
+    reduced_permutations = tuple(pair[0] for pair in basis_pairs)
+    if len(reduced_permutations) != 6 or {tuple(perm) for perm in reduced_permutations} != {
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    }:
+        return None
+
+    full_matrices = tuple(
+        _dense_permutation_matrix(basis_map).astype(np.complex128, copy=False)
+        for _small_perm, basis_map in basis_pairs
+    )
+    dim = full_matrices[0].shape[0]
+    identity = np.eye(dim, dtype=np.complex128)
+
+    trivial_projector = sum(full_matrices) / float(len(full_matrices))
+    sign_projector = sum(
+        _permutation_sign(small_perm) * full_matrix
+        for (small_perm, _basis_map), full_matrix in zip(basis_pairs, full_matrices)
+    ) / float(len(full_matrices))
+    standard_projector = identity - trivial_projector - sign_projector
+
+    trivial_basis = _orthonormal_basis_from_projector(trivial_projector)
+    sign_basis = _orthonormal_basis_from_projector(sign_projector)
+
+    q = np.asarray(
+        [
+            [1.0 / np.sqrt(2.0), 1.0 / np.sqrt(6.0)],
+            [-1.0 / np.sqrt(2.0), 1.0 / np.sqrt(6.0)],
+            [0.0, -2.0 / np.sqrt(6.0)],
+        ],
+        dtype=np.float64,
+    )
+    small_rep_matrices = []
+    for small_perm, _basis_map in basis_pairs:
+        permutation_matrix = _dense_permutation_matrix(small_perm).real.astype(np.float64, copy=False)
+        small_rep_matrices.append(q.T @ permutation_matrix @ q)
+
+    e11 = sum(
+        (2.0 / len(full_matrices)) * rep[0, 0] * full_matrix
+        for rep, full_matrix in zip(small_rep_matrices, full_matrices)
+    )
+    e21 = sum(
+        (2.0 / len(full_matrices)) * rep[1, 0] * full_matrix
+        for rep, full_matrix in zip(small_rep_matrices, full_matrices)
+    )
+
+    standard_first = _orthonormal_basis_from_projector(e11)
+    standard_second = e21 @ standard_first
+    if standard_second.size:
+        gram = standard_first.conj().T @ standard_second
+        if np.linalg.norm(gram, ord="fro") > 1e-8:
+            standard_second = standard_second - standard_first @ gram
+        norms = np.linalg.norm(standard_second, axis=0)
+        valid = norms > 1e-10
+        standard_first = standard_first[:, valid]
+        standard_second = standard_second[:, valid]
+        if standard_second.size:
+            standard_second = standard_second / norms[valid]
+
+    sectors = []
+    if trivial_basis.shape[1]:
+        sectors.append(("sector_trivial", 1, trivial_basis.shape[1], trivial_basis))
+    if sign_basis.shape[1]:
+        sectors.append(("sector_sign", 1, sign_basis.shape[1], sign_basis))
+    if standard_first.shape[1]:
+        standard_basis = np.concatenate((standard_first, standard_second), axis=1)
+        sectors.append(("sector_standard", 2, standard_first.shape[1], standard_basis))
+    return "exact_s3", tuple(sectors)
+
+
+def _exact_small_group_sector_basis_data(
+    basis_pairs: Tuple[Tuple[Tuple[int, ...], Tuple[int, ...]], ...],
+) -> Tuple[str, Tuple[Tuple[str, int, int, np.ndarray], ...]] | None:
+    """Exact reduced-basis path for the small groups that dominate level-3."""
+    if len(basis_pairs) == 1:
+        basis_map = basis_pairs[0][1]
+        dimension = len(basis_map)
+        return (
+            "exact_order_1",
+            (("sector_0", 1, dimension, np.eye(dimension, dtype=np.complex128)),),
+        )
+
+    if len(basis_pairs) == 2:
+        basis_map = basis_pairs[1][1]
+        if all(int(basis_map[int(basis_map[index])]) == index for index in range(len(basis_map))):
+            return _exact_c2_sector_basis_from_basis_map(basis_map)
+
+    return _exact_s3_sector_basis_from_pairs(basis_pairs)
 
 
 
@@ -733,16 +917,172 @@ def _warm_numba_selector_kernels():
     _hermitian_selector_triplets_numba(tiny_real, tiny_imag, 0, -1, 1e-12)
 
 
+def _real_selector_triplets_from_sparse_supports(
+    row_support_cols: np.ndarray,
+    row_support_vals: np.ndarray,
+    col_support_cols: np.ndarray,
+    col_support_vals: np.ndarray,
+    target_row: int,
+    multiplicity: int,
+    tol: float,
+):
+    """Sparse selector triplets for exact small-group real sectors.
+
+    This is the real-symmetric analogue of `_real_selector_triplets_numba`
+    specialized to the exact `order_1` / `C2` bases, where each full-space row
+    only touches a tiny number of reduced coordinates.
+    """
+    if row_support_cols.size == 0 or col_support_cols.size == 0:
+        return (
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=np.float64),
+        )
+
+    coordinate_values: Dict[int, float] = {}
+    for source_col, source_coeff in zip(col_support_cols, col_support_vals):
+        for source_row, row_coeff in zip(row_support_cols, row_support_vals):
+            value = float(source_coeff * row_coeff)
+            if abs(value) <= tol:
+                continue
+            if source_row <= source_col:
+                coordinate = _upper_triangle_coordinate_index(
+                    int(source_row),
+                    int(source_col),
+                    multiplicity,
+                )
+            else:
+                coordinate = _upper_triangle_coordinate_index(
+                    int(source_col),
+                    int(source_row),
+                    multiplicity,
+                )
+            coordinate_values[coordinate] = coordinate_values.get(coordinate, 0.0) + value
+
+    kept_items = [
+        (coordinate, value)
+        for coordinate, value in coordinate_values.items()
+        if abs(value) > tol
+    ]
+    if not kept_items:
+        return (
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=np.float64),
+        )
+    kept_items.sort(key=lambda item: item[0])
+    count = len(kept_items)
+    rows = np.full(count, int(target_row), dtype=np.int32)
+    cols = np.fromiter((coordinate for coordinate, _value in kept_items), dtype=np.int32, count=count)
+    vals = np.fromiter((value for _coordinate, value in kept_items), dtype=np.float64, count=count)
+    return rows, cols, vals
+
+
+def _basis_row_supports(basis: np.ndarray, tol: float = 1e-12):
+    """Reduced-coordinate supports of each full-space row of one exact basis."""
+    basis = np.asarray(basis, dtype=np.complex128)
+    if np.max(np.abs(np.imag(basis))) > tol:
+        return None
+    real_basis = np.ascontiguousarray(np.real(basis), dtype=np.float64)
+    supports = []
+    for row in range(real_basis.shape[0]):
+        nz = np.flatnonzero(np.abs(real_basis[row]) > tol).astype(np.int32, copy=False)
+        supports.append((nz, real_basis[row, nz].astype(np.float64, copy=False)))
+    return tuple(supports)
+
+
+def _exact_small_group_real_identity_coordinate_maps(
+    slot_dims: Tuple[int, ...],
+    symmetry_type: str,
+    sectors,
+):
+    """Cheap identity-map compilation for exact `order_1` / `C2` real layouts."""
+    if symmetry_type not in {"exact_order_1", "exact_c2"}:
+        return None
+    if any(int(irrep_dim) != 1 for _label, irrep_dim, _multiplicity, _basis in sectors):
+        return None
+
+    source_dim = product_dim(slot_dims)
+    target_coord_dim = source_dim * (source_dim + 1) // 2
+    tol = 1e-12
+
+    sector_row_supports = []
+    for _label, _irrep_dim, multiplicity, basis in sectors:
+        row_supports = _basis_row_supports(np.asarray(basis, dtype=np.complex128), tol=tol)
+        if row_supports is None:
+            return None
+        sector_row_supports.append((int(multiplicity), row_supports))
+
+    per_sector_row_blocks = [[] for _ in sectors]
+    per_sector_col_blocks = [[] for _ in sectors]
+    per_sector_val_blocks = [[] for _ in sectors]
+
+    for row in range(source_dim):
+        for col in range(row, source_dim):
+            target_row = _upper_triangle_coordinate_index(row, col, source_dim)
+            for sector_index, (multiplicity, row_supports) in enumerate(sector_row_supports):
+                rows, cols, vals = _real_selector_triplets_from_sparse_supports(
+                    row_supports[row][0],
+                    row_supports[row][1],
+                    row_supports[col][0],
+                    row_supports[col][1],
+                    target_row,
+                    multiplicity,
+                    tol,
+                )
+                if rows.size:
+                    per_sector_row_blocks[sector_index].append(rows)
+                    per_sector_col_blocks[sector_index].append(cols)
+                    per_sector_val_blocks[sector_index].append(vals)
+
+    return (
+        target_coord_dim,
+        tuple(
+            (
+                np.concatenate(rows).astype(np.int32, copy=False)
+                if rows
+                else np.asarray([], dtype=np.int32),
+                np.concatenate(cols).astype(np.int32, copy=False)
+                if cols
+                else np.asarray([], dtype=np.int32),
+                np.concatenate(vals).astype(np.float64, copy=False)
+                if vals
+                else np.asarray([], dtype=np.float64),
+            )
+            for rows, cols, vals in zip(
+                per_sector_row_blocks,
+                per_sector_col_blocks,
+                per_sector_val_blocks,
+            )
+        ),
+    )
+
+
 @lru_cache(maxsize=None)
-def cached_block_partial_trace_coordinate_maps(
-    lexorder: Tuple[str, ...],
+def _cached_block_partial_trace_coordinate_maps(
+    party_signature: Tuple[str, ...],
     slot_dims: Tuple[int, ...],
     local_symmetry_perms: Tuple[Tuple[int, ...], ...],
     keep_positions: Tuple[int, ...],
     Hermitian: bool = True,
 ):
     """Sparse maps from tau sector coordinates to reduced matrix coordinates."""
-    _, sectors = cached_sector_basis_data(lexorder, slot_dims, local_symmetry_perms)
+    symmetry_type, sectors = _cached_sector_basis_data(
+        party_signature,
+        slot_dims,
+        local_symmetry_perms,
+    )
+    if (
+        not Hermitian
+        and keep_positions == tuple(range(len(slot_dims)))
+    ):
+        exact_identity_maps = _exact_small_group_real_identity_coordinate_maps(
+            slot_dims,
+            symmetry_type,
+            sectors,
+        )
+        if exact_identity_maps is not None:
+            return exact_identity_maps
     triplets = cached_partial_trace_selector_triplets(slot_dims, keep_positions)
     source_dim = product_dim(slot_dims)
     kept_dims = tuple(slot_dims[pos] for pos in keep_positions)
@@ -843,6 +1183,22 @@ def cached_block_partial_trace_coordinate_maps(
                 per_sector_val_blocks,
             )
         ),
+    )
+
+
+def cached_block_partial_trace_coordinate_maps(
+    lexorder: Tuple[str, ...],
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+    keep_positions: Tuple[int, ...],
+    Hermitian: bool = True,
+):
+    return _cached_block_partial_trace_coordinate_maps(
+        _party_signature_from_lexorder(lexorder),
+        slot_dims,
+        local_symmetry_perms,
+        keep_positions,
+        Hermitian,
     )
 
 
@@ -982,8 +1338,8 @@ def cached_coordinate_action_for_slot_permutation(
 
 
 @lru_cache(maxsize=None)
-def cached_block_partial_transpose_coordinate_maps(
-    lexorder: Tuple[str, ...],
+def _cached_block_partial_transpose_coordinate_maps(
+    party_signature: Tuple[str, ...],
     slot_dims: Tuple[int, ...],
     local_symmetry_perms: Tuple[Tuple[int, ...], ...],
     transpose_positions: Tuple[int, ...],
@@ -991,8 +1347,8 @@ def cached_block_partial_transpose_coordinate_maps(
 ):
     """Sparse maps from tau sector coordinates to PPT output coordinates."""
     keep_positions = tuple(range(len(slot_dims)))
-    target_coord_dim, sector_maps = cached_block_partial_trace_coordinate_maps(
-        lexorder,
+    target_coord_dim, sector_maps = _cached_block_partial_trace_coordinate_maps(
+        party_signature,
         slot_dims,
         local_symmetry_perms,
         keep_positions,
@@ -1033,6 +1389,51 @@ def cached_block_partial_transpose_coordinate_maps(
     return target_coord_dim, tuple(transformed_sector_maps)
 
 
+def cached_block_partial_transpose_coordinate_maps(
+    lexorder: Tuple[str, ...],
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+    transpose_positions: Tuple[int, ...],
+    Hermitian: bool = True,
+):
+    return _cached_block_partial_transpose_coordinate_maps(
+        _party_signature_from_lexorder(lexorder),
+        slot_dims,
+        local_symmetry_perms,
+        transpose_positions,
+        Hermitian,
+    )
+
+
+@lru_cache(maxsize=None)
+def _cached_tau_ppt_orbit_reduction(
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+    transpose_positions: Tuple[int, ...],
+):
+    """Orbit basis for the partial-transpose stabilizer of one tau source."""
+    slot_count = len(slot_dims)
+    transpose_key = tuple(sorted(transpose_positions))
+    stabilizer = tuple(
+        permutation
+        for permutation in local_symmetry_perms
+        if tuple(sorted(permutation[position] for position in transpose_positions)) == transpose_key
+    )
+    if not stabilizer:
+        stabilizer = (tuple(range(slot_count)),)
+    orbit_data = symmetric_matrix_orbits(slot_dims, stabilizer)
+    representative_rows = np.asarray(
+        [
+            _upper_triangle_coordinate_index(row, col, orbit_data.matrix_dim)
+            for row, col in orbit_data.orbit_representatives
+        ],
+        dtype=np.int32,
+    )
+    row_lookup = np.full(orbit_data.upper_triangular_entries, -1, dtype=np.int32)
+    row_lookup[representative_rows] = np.arange(representative_rows.size, dtype=np.int32)
+    return stabilizer, orbit_data, row_lookup
+
+
 def _matrix_coordinate_vector_expr(real_scalars, imag_scalars, Expr, Hermitian: bool):
     """Coordinate vector for either Hermitian or real-symmetric blocks."""
     if not Hermitian:
@@ -1040,27 +1441,6 @@ def _matrix_coordinate_vector_expr(real_scalars, imag_scalars, Expr, Hermitian: 
     if imag_scalars is None:
         return Expr.flatten(real_scalars)
     return Expr.vstack(Expr.flatten(real_scalars), Expr.flatten(imag_scalars))
-
-
-def _matrix_coordinate_values(matrix: np.ndarray, Hermitian: bool) -> np.ndarray:
-    """Numeric coordinates matching `_matrix_coordinate_vector_expr`."""
-    complex_dim = int(matrix.shape[0])
-    re_values = []
-    for row in range(complex_dim):
-        for col in range(row, complex_dim):
-            re_values.append(float(np.real(matrix[row, col])))
-    if not Hermitian:
-        imag_max = float(np.max(np.abs(np.imag(matrix))))
-        if imag_max > 1e-9:
-            raise ValueError(
-                "Real block formulation received a matrix with non-negligible imaginary entries."
-            )
-        return np.asarray(re_values, dtype=np.float64)
-    im_values = []
-    for row in range(complex_dim):
-        for col in range(row + 1, complex_dim):
-            im_values.append(float(np.imag(matrix[row, col])))
-    return np.asarray(re_values + im_values, dtype=np.float64)
 
 
 @lru_cache(maxsize=None)
@@ -1135,6 +1515,20 @@ def _stack_rhs_blocks(blocks, Expr, Matrix):
     return Expr.vstack(np.asarray(expr_blocks, dtype=object))
 
 
+_REPRESENTATIVE_MAX_BLOCKS_PER_CHUNK = 24
+_REPRESENTATIVE_MAX_ROWS_PER_CHUNK = 4096
+_REPRESENTATIVE_MAX_NNZ_PER_CHUNK = 10_000_000
+_REPRESENTATIVE_MAX_DENSE_BYTES_PER_CHUNK = 128_000_000
+
+_PPT_MAX_BLOCKS_PER_CHUNK = 16
+_PPT_MAX_ROWS_PER_CHUNK = 2048
+_PPT_MAX_NNZ_PER_CHUNK = 5_000_000
+_PPT_MAX_DENSE_BYTES_PER_CHUNK = 64_000_000
+_PPT_MAX_ROWS_PER_EMIT = 65_536
+
+_GLOBAL_PRECOMPILE_CANONICAL_MAP_LIMIT = 96
+
+
 def _chunk_constraint_blocks(
     constraints,
     block_rows_fn,
@@ -1201,10 +1595,10 @@ def _chunk_constraint_blocks(
 def _chunk_representative_constraints(
     constraints_for_source,
     representative_coord_dims: Dict[str, int],
-    max_blocks_per_chunk: int = 48,
-    max_rows_per_chunk: int = 4096,
-    max_nnz_per_chunk: int = 25_000_000,
-    max_dense_bytes_per_chunk: int = 256_000_000,
+    max_blocks_per_chunk: int = _REPRESENTATIVE_MAX_BLOCKS_PER_CHUNK,
+    max_rows_per_chunk: int = _REPRESENTATIVE_MAX_ROWS_PER_CHUNK,
+    max_nnz_per_chunk: int = _REPRESENTATIVE_MAX_NNZ_PER_CHUNK,
+    max_dense_bytes_per_chunk: int = _REPRESENTATIVE_MAX_DENSE_BYTES_PER_CHUNK,
     constraint_nnz_fn=None,
     constraint_dense_bytes_fn=None,
 ):
@@ -1218,6 +1612,118 @@ def _chunk_representative_constraints(
         max_dense_bytes_per_chunk=max_dense_bytes_per_chunk,
         constraint_nnz_fn=constraint_nnz_fn,
         constraint_dense_bytes_fn=constraint_dense_bytes_fn,
+    )
+
+
+def _slice_sorted_triplets(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    vals: np.ndarray,
+    row_start: int,
+    row_stop: int,
+):
+    """Slice one sorted sparse triplet array to a contiguous output-row range."""
+    if rows.size == 0:
+        return rows, cols, vals
+    start = int(np.searchsorted(rows, row_start, side="left"))
+    stop = int(np.searchsorted(rows, row_stop, side="left"))
+    if start >= stop:
+        return (
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=cols.dtype),
+            np.asarray([], dtype=vals.dtype),
+        )
+    return (
+        (rows[start:stop] - row_start).astype(np.int32, copy=False),
+        cols[start:stop],
+        vals[start:stop],
+    )
+
+
+def _slice_sector_triplets(sector_triplets, row_start: int, row_stop: int):
+    """Slice one sectorwise sparse payload to a contiguous output-row range."""
+    return tuple(
+        _slice_sorted_triplets(rows, cols, vals, row_start, row_stop)
+        for rows, cols, vals in sector_triplets
+    )
+
+
+def _restrict_sector_triplets_to_row_lookup(sector_triplets, row_lookup: np.ndarray):
+    """Keep only rows present in `row_lookup`, remapping them densely."""
+    restricted_triplets = []
+    for rows, cols, vals in sector_triplets:
+        if rows.size == 0:
+            restricted_triplets.append(
+                (
+                    np.asarray([], dtype=np.int32),
+                    np.asarray([], dtype=np.int32),
+                    np.asarray([], dtype=np.float64),
+                )
+            )
+            continue
+        remapped_rows = row_lookup[rows]
+        mask = remapped_rows >= 0
+        if not np.any(mask):
+            restricted_triplets.append(
+                (
+                    np.asarray([], dtype=np.int32),
+                    np.asarray([], dtype=np.int32),
+                    np.asarray([], dtype=np.float64),
+                )
+            )
+            continue
+        kept_rows = remapped_rows[mask].astype(np.int32, copy=False)
+        kept_cols = cols[mask].astype(np.int32, copy=False)
+        kept_vals = vals[mask].astype(np.float64, copy=False)
+        if kept_rows.size > 1:
+            order = np.argsort(kept_rows, kind="stable")
+            kept_rows = kept_rows[order]
+            kept_cols = kept_cols[order]
+            kept_vals = kept_vals[order]
+        restricted_triplets.append(
+            (
+                kept_rows,
+                kept_cols,
+                kept_vals,
+            )
+        )
+    return tuple(restricted_triplets)
+
+
+def _slice_stacked_expr_blocks(blocks, block_dims, row_start: int, row_stop: int, Expr):
+    """Slice a stacked list of coordinate vectors without materializing the full stack."""
+    sliced_blocks = []
+    offset = 0
+    for block, block_dim in zip(blocks, block_dims):
+        block_dim = int(block_dim)
+        next_offset = offset + block_dim
+        if next_offset <= row_start:
+            offset = next_offset
+            continue
+        if offset >= row_stop:
+            break
+        local_start = max(0, row_start - offset)
+        local_stop = min(block_dim, row_stop - offset)
+        if local_start < local_stop:
+            if local_start == 0 and local_stop == block_dim:
+                sliced_blocks.append(block)
+            else:
+                sliced_blocks.append(block.slice(int(local_start), int(local_stop)))
+        offset = next_offset
+    return _stack_coordinate_vectors(tuple(sliced_blocks), Expr)
+
+
+def _iter_emit_row_ranges(total_rows: int, max_rows_per_emit: int):
+    """Contiguous row ranges for splitting oversized Fusion equalities."""
+    total_rows = int(total_rows)
+    max_rows_per_emit = int(max_rows_per_emit)
+    if total_rows <= 0:
+        return tuple()
+    if max_rows_per_emit <= 0 or total_rows <= max_rows_per_emit:
+        return ((0, total_rows),)
+    return tuple(
+        (row_start, min(total_rows, row_start + max_rows_per_emit))
+        for row_start in range(0, total_rows, max_rows_per_emit)
     )
 
 
@@ -1261,9 +1767,12 @@ def _build_real_symmetric_matrix(
     """Affine expression for a real symmetric matrix from upper-triangle scalars."""
     variable_count = matrix_dim * (matrix_dim + 1) // 2
     scalars = M.variable(f"{name}_re", variable_count, Domain.unbounded())
-    rows, cols, vals = _cached_real_symmetric_lifting_triplets(matrix_dim)
-    lifting = Matrix.sparse(matrix_dim * matrix_dim, variable_count, rows, cols, vals)
-    matrix_expr = Expr.reshape(Expr.mul(lifting, scalars), matrix_dim, matrix_dim)
+    matrix_expr = real_symmetric_matrix_from_coordinate_expr(
+        scalars,
+        matrix_dim,
+        Expr,
+        Matrix,
+    )
     return scalars, matrix_expr
 
 
@@ -1286,6 +1795,50 @@ def _build_real_skew_matrix(
     matrix_expr = Expr.reshape(Expr.mul(lifting, scalars), matrix_dim, matrix_dim)
     return scalars, matrix_expr
 
+
+
+def real_symmetric_matrix_from_coordinate_expr(
+    coordinate_expr,
+    matrix_dim: int,
+    Expr,
+    Matrix,
+):
+    """Affine symmetric matrix expression from upper-triangle coordinates."""
+    variable_count = matrix_dim * (matrix_dim + 1) // 2
+    rows, cols, vals = _cached_real_symmetric_lifting_triplets(matrix_dim)
+    lifting = Matrix.sparse(matrix_dim * matrix_dim, variable_count, rows, cols, vals)
+    return Expr.reshape(Expr.mul(lifting, coordinate_expr), matrix_dim, matrix_dim)
+
+
+@lru_cache(maxsize=None)
+def _cached_real_svec_scaling_triplets(matrix_dim: int):
+    """Diagonal scaling taking upper-triangle coordinates to MOSEK's sVec form."""
+    coord_dim = matrix_dim * (matrix_dim + 1) // 2
+    rows = np.arange(coord_dim, dtype=np.int32)
+    cols = rows.copy()
+    vals = np.empty(coord_dim, dtype=np.float64)
+    cursor = 0
+    sqrt2 = np.sqrt(2.0)
+    for row in range(matrix_dim):
+        vals[cursor] = 1.0
+        cursor += 1
+        for _col in range(row + 1, matrix_dim):
+            vals[cursor] = sqrt2
+            cursor += 1
+    return rows, cols, vals
+
+
+def real_svec_expr_from_coordinate_expr(
+    coordinate_expr,
+    matrix_dim: int,
+    Expr,
+    Matrix,
+):
+    """Scaled symmetric-vector expression compatible with `Domain.inSVecPSDCone`."""
+    coord_dim = matrix_dim * (matrix_dim + 1) // 2
+    rows, cols, vals = _cached_real_svec_scaling_triplets(matrix_dim)
+    scaling = Matrix.sparse(coord_dim, coord_dim, rows, cols, vals)
+    return Expr.mul(scaling, coordinate_expr)
 
 
 def hermitian_psd_expression(
@@ -1353,6 +1906,9 @@ def _sector_basis_data(
 ):
     """Automatic complex isotypic bases from the generated local symmetry action."""
     basis_pairs = _basis_maps_for_variable(lexorder, slot_dims, local_symmetry_perms)
+    exact_sector_data = _exact_small_group_sector_basis_data(basis_pairs)
+    if exact_sector_data is not None:
+        return exact_sector_data
     reduced_permutations = tuple(pair[0] for pair in basis_pairs)
     basis_maps = tuple(pair[1] for pair in basis_pairs)
     unitary_representation = tuple(_dense_permutation_matrix(basis_map) for basis_map in basis_maps)
@@ -1360,29 +1916,75 @@ def _sector_basis_data(
 
 
 @lru_cache(maxsize=None)
+def _cached_sector_basis_data(
+    party_signature: Tuple[str, ...],
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+):
+    cache_key = (
+        "sector_basis_v2",
+        party_signature,
+        slot_dims,
+        local_symmetry_perms,
+    )
+    cached = _load_persistent_object(cache_key)
+    if cached is not None:
+        try:
+            symmetry_type, sectors = cached
+            restored_sectors = tuple(
+                (
+                    str(label),
+                    int(irrep_dim),
+                    int(multiplicity),
+                    np.asarray(basis, dtype=np.complex128),
+                )
+                for label, irrep_dim, multiplicity, basis in sectors
+            )
+            return symmetry_type, restored_sectors
+        except Exception:
+            pass
+
+    sector_data = _sector_basis_data(party_signature, slot_dims, local_symmetry_perms)
+    try:
+        symmetry_type, sectors = sector_data
+        payload = (
+            symmetry_type,
+            tuple(
+                (
+                    label,
+                    irrep_dim,
+                    multiplicity,
+                    np.asarray(basis, dtype=np.complex128),
+                )
+                for label, irrep_dim, multiplicity, basis in sectors
+            ),
+        )
+        _save_persistent_object(cache_key, payload)
+    except Exception:
+        pass
+    return sector_data
+
+
 def cached_sector_basis_data(
     lexorder: Tuple[str, ...],
     slot_dims: Tuple[int, ...],
     local_symmetry_perms: Tuple[Tuple[int, ...], ...],
 ):
-    return _sector_basis_data(lexorder, slot_dims, local_symmetry_perms)
+    return _cached_sector_basis_data(
+        _party_signature_from_lexorder(lexorder),
+        slot_dims,
+        local_symmetry_perms,
+    )
 
 
 @lru_cache(maxsize=None)
-def cached_tau_layout(
-    name: str,
-    lexorder: Tuple[str, ...],
+def _cached_tau_layout_structure(
+    party_signature: Tuple[str, ...],
     slot_dims: Tuple[int, ...],
     local_symmetry_perms: Tuple[Tuple[int, ...], ...],
-) -> SymmetryAdaptedTauLayout:
-    """Analyze one full inflation variable and cache its symmetry-adapted layout.
-
-    This is the declaration-level object we want the backend to depend on:
-    the variable is first reduced by symmetry, and only then translated into
-    solver variables.
-    """
-    symmetry_type, sectors = cached_sector_basis_data(
-        lexorder,
+):
+    symmetry_type, sectors = _cached_sector_basis_data(
+        party_signature,
         slot_dims,
         local_symmetry_perms,
     )
@@ -1402,6 +2004,31 @@ def cached_tau_layout(
     real_parameter_count = sum(
         layout.multiplicity * (layout.multiplicity + 1) // 2
         for layout in sector_layouts
+    )
+    return symmetry_type, sector_layouts, hermitian_parameter_count, real_parameter_count
+
+
+def cached_tau_layout(
+    name: str,
+    lexorder: Tuple[str, ...],
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+) -> SymmetryAdaptedTauLayout:
+    """Analyze one full inflation variable and cache its symmetry-adapted layout.
+
+    This is the declaration-level object we want the backend to depend on:
+    the variable is first reduced by symmetry, and only then translated into
+    solver variables.
+    """
+    (
+        symmetry_type,
+        sector_layouts,
+        hermitian_parameter_count,
+        real_parameter_count,
+    ) = _cached_tau_layout_structure(
+        _party_signature_from_lexorder(lexorder),
+        slot_dims,
+        local_symmetry_perms,
     )
     return SymmetryAdaptedTauLayout(
         name=name,
@@ -1506,7 +2133,7 @@ def build_block_fusion_feasibility_model(
     model_name: str = "GNMEBlockStateSDP",
     include_ppt: bool = True,
     include_representatives: bool = True,
-    enforce_known_values: bool = True,
+    enforce_known_values: bool = False,
     Hermitian: bool = True,
     verbose: int | None = None,
 ):
@@ -1518,10 +2145,12 @@ def build_block_fusion_feasibility_model(
 
     if isinstance(assigned, AssignedStateSDPDraft):
         model = assigned.model
-        known_values = assigned.known_values
     else:
         model = assigned
-        known_values = {}
+    # Known representatives stay as free PSD variables. The public flag is
+    # retained for API compatibility, but the active backend path does not
+    # inject fixed numeric matrices directly into the model.
+    _ = enforce_known_values
 
     active_ppt_variables = model.ppt_variables
     active_ppt_constraints = model.ppt_constraints
@@ -1530,6 +2159,11 @@ def build_block_fusion_feasibility_model(
             model,
             use_source_symmetry=True,
         )
+    direct_ppt_constraints = tuple()
+    if include_ppt and not Hermitian:
+        direct_ppt_constraints = tuple(active_ppt_constraints)
+        active_ppt_constraints = tuple()
+        active_ppt_variables = tuple()
 
     real_verbose = _resolve_verbose(verbose, model.verbose)
     total_start = perf_counter()
@@ -1549,6 +2183,9 @@ def build_block_fusion_feasibility_model(
         "representative_batch_sparse_time": 0.0,
         "representative_batch_rhs_stack_time": 0.0,
         "representative_constraint_emit_time": 0.0,
+        "representative_direct_count": 0,
+        "representative_direct_expr_time": 0.0,
+        "representative_direct_emit_time": 0.0,
         "representative_unique_canonical_maps": 0,
         "representative_source_batches": 0,
         "representative_chunk_count": 0,
@@ -1565,6 +2202,21 @@ def build_block_fusion_feasibility_model(
         "ppt_constraint_emit_time": 0.0,
         "ppt_source_batches": 0,
         "ppt_chunk_count": 0,
+        "ppt_emit_slice_count": 0,
+        "ppt_direct_count": 0,
+        "ppt_direct_mul_time": 0.0,
+        "ppt_direct_svec_time": 0.0,
+        "ppt_direct_emit_time": 0.0,
+        "ppt_direct_tau_count": 0,
+        "ppt_direct_tau_rows_full": 0,
+        "ppt_direct_tau_rows_reduced": 0,
+        "ppt_direct_tau_select_time": 0.0,
+        "ppt_direct_tau_mul_time": 0.0,
+        "ppt_direct_tau_emit_time": 0.0,
+        "ppt_direct_reduced_count": 0,
+        "ppt_direct_reduced_mul_time": 0.0,
+        "ppt_direct_reduced_svec_time": 0.0,
+        "ppt_direct_reduced_emit_time": 0.0,
         "ppt_emit_time": 0.0,
         "tau_map_memory_hits": 0,
         "tau_map_disk_hits": 0,
@@ -1635,12 +2287,14 @@ def build_block_fusion_feasibility_model(
         f"in {perf_counter() - step_start:.2f}s.",
     )
     build_profile["tau_declaration_time"] = perf_counter() - step_start
+    tau_variable_specs = {variable.name: variable for variable in model.psd_variables}
 
     # Step 2: auxiliary reduced states, known free states, and PPT auxiliaries.
     step_start = perf_counter()
     auxiliary_variables = {}
     auxiliary_coordinate_vectors = {}
     representative_coord_dims = {}
+    direct_real_representatives = not Hermitian
     aux_iter = _progress_bar(
         model.auxiliary_representatives,
         real_verbose,
@@ -1649,6 +2303,13 @@ def build_block_fusion_feasibility_model(
     )
     expression_builder = hermitian_psd_expression if Hermitian else real_symmetric_psd_expression
     for representative in aux_iter:
+        representative_coord_dims[representative.name] = (
+            representative.matrix_dim * representative.matrix_dim
+            if Hermitian
+            else representative.matrix_dim * (representative.matrix_dim + 1) // 2
+        )
+        if direct_real_representatives:
+            continue
         scalar_vars, expr = expression_builder(
             M,
             representative.name,
@@ -1664,52 +2325,45 @@ def build_block_fusion_feasibility_model(
             Expr,
             Hermitian,
         )
+    known_representative_variables = {}
+    known_representative_coordinate_vectors = {}
+    known_iter = _progress_bar(
+        model.known_representatives,
+        real_verbose,
+        "block step 2: known reps",
+        total=len(model.known_representatives),
+    )
+    for representative in known_iter:
         representative_coord_dims[representative.name] = (
             representative.matrix_dim * representative.matrix_dim
             if Hermitian
             else representative.matrix_dim * (representative.matrix_dim + 1) // 2
         )
-    known_representative_variables = {}
-    known_representative_coordinate_vectors = {}
-    if not enforce_known_values:
-        known_iter = _progress_bar(
-            model.known_representatives,
-            real_verbose,
-            "block step 2: free known reps",
-            total=len(model.known_representatives),
+        if direct_real_representatives:
+            continue
+        scalar_vars, expr = expression_builder(
+            M,
+            representative.name,
+            representative.matrix_dim,
+            Domain,
+            Expr,
+            Matrix,
         )
-        for representative in known_iter:
-            scalar_vars, expr = expression_builder(
-                M,
-                representative.name,
-                representative.matrix_dim,
-                Domain,
-                Expr,
-                Matrix,
-            )
-            known_representative_variables[representative.name] = expr
-            known_representative_coordinate_vectors[representative.name] = _matrix_coordinate_vector_expr(
-                scalar_vars[0],
-                scalar_vars[1],
-                Expr,
-                Hermitian,
-            )
-        for representative in model.known_representatives:
-            representative_coord_dims[representative.name] = (
-                representative.matrix_dim * representative.matrix_dim
-                if Hermitian
-                else representative.matrix_dim * (representative.matrix_dim + 1) // 2
-            )
-    else:
-        for representative in model.known_representatives:
-            representative_coord_dims[representative.name] = (
-                representative.matrix_dim * representative.matrix_dim
-                if Hermitian
-                else representative.matrix_dim * (representative.matrix_dim + 1) // 2
-            )
+        known_representative_variables[representative.name] = expr
+        known_representative_coordinate_vectors[representative.name] = _matrix_coordinate_vector_expr(
+            scalar_vars[0],
+            scalar_vars[1],
+            Expr,
+            Hermitian,
+        )
     ppt_variables = {}
     ppt_coordinate_vectors = {}
     ppt_coordinate_dims = {}
+    direct_ppt_coordinate_vectors = {}
+    direct_tau_ppt_row_lookups = {}
+    direct_tau_ppt_sector_coordinate_vectors = {}
+    direct_tau_ppt_sector_coordinate_dims = {}
+    direct_tau_ppt_sector_maps = {}
     if include_ppt:
         ppt_iter = _progress_bar(
             active_ppt_variables,
@@ -1736,25 +2390,101 @@ def build_block_fusion_feasibility_model(
             ppt_coordinate_dims[ppt_variable.name] = int(
                 ppt_coordinate_vectors[ppt_variable.name].getShape()[0]
             )
+        if direct_ppt_constraints:
+            direct_iter = _progress_bar(
+                direct_ppt_constraints,
+                real_verbose,
+                "block step 2: direct PPT vars",
+                total=len(direct_ppt_constraints),
+            )
+            for constraint in direct_iter:
+                if constraint.source_variable_name in tau_variable_specs:
+                    source_spec = tau_variable_specs[constraint.source_variable_name]
+                    stabilizer_perms, orbit_data, row_lookup = _cached_tau_ppt_orbit_reduction(
+                        source_spec.slot_dims,
+                        source_spec.local_symmetry_perms,
+                        constraint.transpose_positions,
+                    )
+                    stabilizer_layout = cached_tau_layout(
+                        constraint.ppt_variable_name,
+                        source_spec.lexorder,
+                        source_spec.slot_dims,
+                        stabilizer_perms,
+                    )
+                    sector_block_data, block_data = declare_symmetry_adapted_tau_variable(
+                        M,
+                        SimpleNamespace(name=constraint.ppt_variable_name),
+                        stabilizer_layout,
+                        Domain,
+                        Expr,
+                        Matrix,
+                        Hermitian=False,
+                    )
+                    direct_tau_ppt_row_lookups[constraint.ppt_variable_name] = row_lookup
+                    direct_tau_ppt_sector_coordinate_vectors[constraint.ppt_variable_name] = tuple(
+                        sector.coordinate_vector for sector in sector_block_data
+                    )
+                    direct_tau_ppt_sector_coordinate_dims[constraint.ppt_variable_name] = tuple(
+                        sector.coordinate_dim for sector in sector_block_data
+                    )
+                    _target_coord_dim, lhs_sector_maps = _cached_block_partial_trace_coordinate_maps(
+                        _party_signature_from_lexorder(source_spec.lexorder),
+                        source_spec.slot_dims,
+                        stabilizer_perms,
+                        tuple(range(len(source_spec.slot_dims))),
+                        False,
+                    )
+                    direct_tau_ppt_sector_maps[constraint.ppt_variable_name] = (
+                        _restrict_sector_triplets_to_row_lookup(lhs_sector_maps, row_lookup)
+                    )
+                    ppt_variables[constraint.ppt_variable_name] = block_data
+                    ppt_coordinate_dims[constraint.ppt_variable_name] = len(
+                        orbit_data.orbit_representatives
+                    )
+                    build_profile["ppt_direct_tau_rows_full"] += (
+                        constraint.matrix_dim * (constraint.matrix_dim + 1) // 2
+                    )
+                    build_profile["ppt_direct_tau_rows_reduced"] += len(
+                        orbit_data.orbit_representatives
+                    )
+                else:
+                    coord_dim = constraint.matrix_dim * (constraint.matrix_dim + 1) // 2
+                    direct_ppt_coordinate_vectors[constraint.ppt_variable_name] = M.variable(
+                        f"{constraint.ppt_variable_name}_svec",
+                        Domain.inSVecPSDCone(coord_dim),
+                    )
+                    ppt_coordinate_dims[constraint.ppt_variable_name] = coord_dim
     _progress_log(
         real_verbose,
         1,
         "Fusion block step 2/5 complete: "
-        f"{len(auxiliary_variables)} auxiliary, {len(known_representative_variables)} free known, "
-        f"{len(ppt_variables)} PPT variables in {perf_counter() - step_start:.2f}s.",
+        f"{len(auxiliary_variables)} auxiliary vars, {len(known_representative_variables)} known vars, "
+        f"{len(model.auxiliary_representatives) + len(model.known_representatives) if direct_real_representatives else 0} direct representatives, "
+        f"{len(ppt_variables)} PPT variables, {len(direct_ppt_constraints)} direct real PPT cones "
+        f"in {perf_counter() - step_start:.2f}s.",
     )
     constraint_counts = {
         "trace": 0,
         "internal_symmetry": 0,
         "representative": 0,
         "ppt": 0,
+        "ppt_direct": 0,
         "block_parameters": total_block_parameters,
     }
     build_profile["auxiliary_declaration_time"] = perf_counter() - step_start
     compiled_linear_maps = {}
     compiled_triplet_maps = {}
     compiled_sector_triplet_maps = {}
-    compiled_batch_triplet_maps = {}
+
+    def _source_layout_signature(source_spec) -> Tuple[object, ...]:
+        return (
+            *_layout_signature(
+                source_spec.lexorder,
+                source_spec.slot_dims,
+                source_spec.local_symmetry_perms,
+            ),
+            tuple(int(dim) for dim in tau_sector_coordinate_dims[source_spec.name]),
+        )
 
     def _canonicalize_source_positions(source_spec, positions, map_kind: str):
         positions = tuple(positions)
@@ -1812,13 +2542,11 @@ def build_block_fusion_feasibility_model(
 
     def _compile_canonical_tau_triplets(source_spec, canonical_positions, map_kind: str):
         cache_key = (
+            "combined",
             map_kind,
-            source_spec.lexorder,
-            source_spec.slot_dims,
-            source_spec.local_symmetry_perms,
+            _source_layout_signature(source_spec),
             canonical_positions,
             Hermitian,
-            tau_sector_coordinate_dims[source_spec.name],
         )
         compiled = compiled_triplet_maps.get(cache_key)
         if compiled is None:
@@ -1865,12 +2593,9 @@ def build_block_fusion_feasibility_model(
         cache_key = (
             "sectorwise",
             map_kind,
-            source_spec.lexorder,
-            source_spec.slot_dims,
-            source_spec.local_symmetry_perms,
+            _source_layout_signature(source_spec),
             canonical_positions,
             Hermitian,
-            tau_sector_coordinate_dims[source_spec.name],
         )
         compiled = compiled_sector_triplet_maps.get(cache_key)
         if compiled is not None:
@@ -1961,7 +2686,7 @@ def build_block_fusion_feasibility_model(
         transport_key = (
             "transported",
             map_kind,
-            source_spec.name,
+            _source_layout_signature(source_spec),
             canonical_positions,
             positions,
             Hermitian,
@@ -1995,7 +2720,7 @@ def build_block_fusion_feasibility_model(
         transport_key = (
             "sectorwise_transported",
             map_kind,
-            source_spec.name,
+            _source_layout_signature(source_spec),
             canonical_positions,
             positions,
             Hermitian,
@@ -2051,7 +2776,7 @@ def build_block_fusion_feasibility_model(
     def get_cached_tau_linear_map(source_spec, positions, map_kind: str):
         sparse_key = (
             "matrix",
-            source_spec.name,
+            _source_layout_signature(source_spec),
             map_kind,
             tuple(positions),
             Hermitian,
@@ -2107,40 +2832,6 @@ def build_block_fusion_feasibility_model(
         blocks, so we cache the fully stacked triplets for each source/chunk
         signature and reuse them across runs.
         """
-        keep_positions_sequence = tuple(
-            tuple(constraint.keep_positions) for constraint in constraints_for_source
-        )
-        cache_key = (
-            "rep_batch_triplets",
-            source_spec.lexorder,
-            source_spec.slot_dims,
-            source_spec.local_symmetry_perms,
-            keep_positions_sequence,
-            Hermitian,
-            tau_sector_coordinate_dims[source_spec.name],
-        )
-        cached_payload = compiled_batch_triplet_maps.get(cache_key)
-        if cached_payload is not None:
-            build_profile["representative_batch_memory_hits"] += 1
-            return cached_payload
-
-        persistent_payload = _load_persistent_object(cache_key)
-        if persistent_payload is not None:
-            try:
-                row_offset, rows, cols, vals, target_dims = persistent_payload
-                cached_payload = (
-                    int(row_offset),
-                    np.asarray(rows, dtype=np.int32),
-                    np.asarray(cols, dtype=np.int32),
-                    np.asarray(vals, dtype=np.float64),
-                    tuple(int(dim) for dim in target_dims),
-                )
-                compiled_batch_triplet_maps[cache_key] = cached_payload
-                build_profile["representative_batch_disk_hits"] += 1
-                return cached_payload
-            except Exception:
-                pass
-
         compile_start = perf_counter()
         triplet_blocks = []
         target_dims = []
@@ -2183,17 +2874,6 @@ def build_block_fusion_feasibility_model(
             batch_vals,
             tuple(target_dims),
         )
-        compiled_batch_triplet_maps[cache_key] = cached_payload
-        _save_persistent_object(
-            cache_key,
-            (
-                int(row_offset),
-                batch_rows,
-                batch_cols,
-                batch_vals,
-                tuple(target_dims),
-            ),
-        )
         build_profile["representative_batch_misses"] += 1
         build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
         return cached_payload
@@ -2205,41 +2885,33 @@ def build_block_fusion_feasibility_model(
         )
         cache_key = (
             "rep_sector_batch_triplets",
-            source_spec.lexorder,
-            source_spec.slot_dims,
-            source_spec.local_symmetry_perms,
+            _source_layout_signature(source_spec),
             keep_positions_sequence,
             Hermitian,
-            tau_sector_coordinate_dims[source_spec.name],
         )
-        cached_payload = compiled_batch_triplet_maps.get(cache_key)
-        if cached_payload is not None:
-            build_profile["representative_batch_memory_hits"] += 1
-            return cached_payload
-
-        persistent_payload = _load_persistent_object(cache_key)
-        if persistent_payload is not None:
-            try:
-                row_offset, sector_payload, target_dims = persistent_payload
-                cached_payload = (
-                    int(row_offset),
-                    tuple(
-                        (
-                            np.asarray(rows, dtype=np.int32),
-                            np.asarray(cols, dtype=np.int32),
-                            np.asarray(vals, dtype=np.float64),
-                        )
-                        for rows, cols, vals in sector_payload
-                    ),
-                    tuple(int(dim) for dim in target_dims),
-                )
-                compiled_batch_triplet_maps[cache_key] = cached_payload
-                build_profile["representative_batch_disk_hits"] += 1
-                return cached_payload
-            except Exception:
-                pass
-
         compile_start = perf_counter()
+        if len(constraints_for_source) == 1:
+            constraint = constraints_for_source[0]
+            target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
+                source_spec,
+                constraint.keep_positions,
+                "partial_trace",
+            )
+            cached_payload = (
+                int(target_coord_dim),
+                tuple(
+                    (
+                        rows.astype(np.int32, copy=False),
+                        cols.astype(np.int32, copy=False),
+                        vals.astype(np.float64, copy=False),
+                    )
+                    for rows, cols, vals in sector_maps
+                ),
+                (int(target_coord_dim),),
+            )
+            build_profile["representative_batch_misses"] += 1
+            build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
+            return cached_payload
         sector_triplet_blocks = [[] for _ in tau_sector_coordinate_dims[source_spec.name]]
         sector_total_nnz = [0 for _ in tau_sector_coordinate_dims[source_spec.name]]
         target_dims = []
@@ -2283,8 +2955,6 @@ def build_block_fusion_feasibility_model(
             tuple(sector_payload),
             tuple(target_dims),
         )
-        compiled_batch_triplet_maps[cache_key] = cached_payload
-        _save_persistent_object(cache_key, cached_payload)
         build_profile["representative_batch_misses"] += 1
         build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
         return cached_payload
@@ -2296,39 +2966,32 @@ def build_block_fusion_feasibility_model(
         )
         cache_key = (
             "ppt_sector_batch_triplets",
-            source_spec.lexorder,
-            source_spec.slot_dims,
-            source_spec.local_symmetry_perms,
+            _source_layout_signature(source_spec),
             transpose_positions_sequence,
             Hermitian,
-            tau_sector_coordinate_dims[source_spec.name],
         )
-        cached_payload = compiled_batch_triplet_maps.get(cache_key)
-        if cached_payload is not None:
-            return cached_payload
-
-        persistent_payload = _load_persistent_object(cache_key)
-        if persistent_payload is not None:
-            try:
-                row_offset, sector_payload, target_dims = persistent_payload
-                cached_payload = (
-                    int(row_offset),
-                    tuple(
-                        (
-                            np.asarray(rows, dtype=np.int32),
-                            np.asarray(cols, dtype=np.int32),
-                            np.asarray(vals, dtype=np.float64),
-                        )
-                        for rows, cols, vals in sector_payload
-                    ),
-                    tuple(int(dim) for dim in target_dims),
-                )
-                compiled_batch_triplet_maps[cache_key] = cached_payload
-                return cached_payload
-            except Exception:
-                pass
-
         compile_start = perf_counter()
+        if len(constraints_for_source) == 1:
+            constraint = constraints_for_source[0]
+            target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
+                source_spec,
+                constraint.transpose_positions,
+                "partial_transpose",
+            )
+            cached_payload = (
+                int(target_coord_dim),
+                tuple(
+                    (
+                        rows.astype(np.int32, copy=False),
+                        cols.astype(np.int32, copy=False),
+                        vals.astype(np.float64, copy=False),
+                    )
+                    for rows, cols, vals in sector_maps
+                ),
+                (int(target_coord_dim),),
+            )
+            build_profile["ppt_batch_triplet_time"] += perf_counter() - compile_start
+            return cached_payload
         sector_triplet_blocks = [[] for _ in tau_sector_coordinate_dims[source_spec.name]]
         sector_total_nnz = [0 for _ in tau_sector_coordinate_dims[source_spec.name]]
         target_dims = []
@@ -2372,18 +3035,8 @@ def build_block_fusion_feasibility_model(
             tuple(sector_payload),
             tuple(target_dims),
         )
-        compiled_batch_triplet_maps[cache_key] = cached_payload
-        _save_persistent_object(cache_key, cached_payload)
         build_profile["ppt_batch_triplet_time"] += perf_counter() - compile_start
         return cached_payload
-
-    known_coordinate_values = {}
-    if enforce_known_values:
-        for representative_name, known_assignment in known_values.items():
-            known_coordinate_values[representative_name] = _matrix_coordinate_values(
-                np.asarray(known_assignment.matrix, dtype=complex),
-                Hermitian,
-            )
 
     # Step 3: trace-one constraints.
     step_start = perf_counter()
@@ -2410,6 +3063,8 @@ def build_block_fusion_feasibility_model(
         )
         constraint_counts["trace"] += 1
     for representative in model.auxiliary_representatives:
+        if representative.name not in auxiliary_variables:
+            continue
         M.constraint(
             f"trace_{representative.name}",
             _hermitian_trace_expr(
@@ -2424,22 +3079,23 @@ def build_block_fusion_feasibility_model(
             Domain.equalsTo(1.0),
         )
         constraint_counts["trace"] += 1
-    if not enforce_known_values:
-        for representative in model.known_representatives:
-            M.constraint(
-                f"trace_{representative.name}",
-                _hermitian_trace_expr(
-                    known_representative_variables[representative.name],
-                    representative.matrix_dim,
-                    Expr,
-                ) if Hermitian else _real_trace_expr(
-                    known_representative_variables[representative.name],
-                    representative.matrix_dim,
-                    Expr,
-                ),
-                Domain.equalsTo(1.0),
-            )
-            constraint_counts["trace"] += 1
+    for representative in model.known_representatives:
+        if representative.name not in known_representative_variables:
+            continue
+        M.constraint(
+            f"trace_{representative.name}",
+            _hermitian_trace_expr(
+                known_representative_variables[representative.name],
+                representative.matrix_dim,
+                Expr,
+            ) if Hermitian else _real_trace_expr(
+                known_representative_variables[representative.name],
+                representative.matrix_dim,
+                Expr,
+            ),
+            Domain.equalsTo(1.0),
+        )
+        constraint_counts["trace"] += 1
     _progress_log(
         real_verbose,
         1,
@@ -2463,125 +3119,230 @@ def build_block_fusion_feasibility_model(
             f"Fusion block step 4/5: adding {len(representative_constraints)} representative blocks...",
         )
         tau_variable_specs = {variable.name: variable for variable in model.psd_variables}
-        grouped_representatives = defaultdict(list)
-        unique_canonical_maps = {}
-        for constraint in representative_constraints:
-            source_spec = tau_variable_specs[constraint.source_variable_name]
-            grouped_representatives[constraint.source_variable_name].append(constraint)
-            canonical_positions, _transport_rows, _transport_signs = _canonicalize_source_positions(
-                source_spec,
-                constraint.keep_positions,
-                "partial_trace",
-            )
-            unique_canonical_maps[
-                (
-                    source_spec.name,
-                    source_spec.lexorder,
-                    source_spec.slot_dims,
-                    source_spec.local_symmetry_perms,
-                    canonical_positions,
-                )
-            ] = source_spec
+        if direct_real_representatives:
+            representative_lookup = {
+                representative.name: representative
+                for representative in (*model.auxiliary_representatives, *model.known_representatives)
+            }
+            grouped_representatives = defaultdict(list)
+            for constraint in representative_constraints:
+                grouped_representatives[constraint.representative_name].append(constraint)
+            build_profile["representative_source_batches"] = len(grouped_representatives)
+            batch_start = perf_counter()
+            reduced_expr_cache = {}
 
-        build_profile["representative_unique_canonical_maps"] = len(unique_canonical_maps)
-        build_profile["representative_source_batches"] = len(grouped_representatives)
-
-        precompile_start = perf_counter()
-        precompile_iter = _progress_bar(
-            list(unique_canonical_maps.items()),
-            real_verbose,
-            "block step 4a: compile canonical maps",
-            total=len(unique_canonical_maps),
-        )
-        for (
-            _source_name,
-            _lexorder,
-            _slot_dims,
-            _local_symmetry_perms,
-            canonical_positions,
-        ), source_spec in precompile_iter:
-            _compile_canonical_tau_sector_triplets(source_spec, canonical_positions, "partial_trace")
-        build_profile["representative_precompile_time"] = perf_counter() - precompile_start
-
-        batch_start = perf_counter()
-        group_items = list(grouped_representatives.items())
-        rep_iter = _progress_bar(
-            group_items,
-            real_verbose,
-            "block step 4b: representative batches",
-            total=len(group_items),
-        )
-        for batch_index, (source_name, constraints_for_source) in enumerate(rep_iter, start=1):
-            if real_verbose >= 2:
-                _progress_log(
-                    real_verbose,
-                    2,
-                        f"  representative batch {batch_index}/{len(group_items)} for {source_name} "
-                        f"with {len(constraints_for_source)} blocks",
-                )
-            source_spec = tau_variable_specs[source_name]
-            constraint_chunks = _chunk_representative_constraints(
-                constraints_for_source,
-                representative_coord_dims,
-                constraint_nnz_fn=lambda constraint, _source_spec=source_spec: get_cached_tau_sector_linear_map_nnz(
-                    _source_spec,
-                    constraint.keep_positions,
-                    "partial_trace",
-                ),
-            )
-            build_profile["representative_chunk_count"] += len(constraint_chunks)
-            for chunk_index, constraint_chunk in enumerate(constraint_chunks, start=1):
-                compile_start = perf_counter()
-                row_offset, sector_triplets, target_dims = get_cached_representative_sector_batch_triplets(
+            def get_tau_reduced_coordinate_expr(source_spec, keep_positions):
+                cache_key = (source_spec.name, tuple(keep_positions))
+                cached = reduced_expr_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+                expr_start = perf_counter()
+                target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
                     source_spec,
-                    constraint_chunk,
+                    keep_positions,
+                    "partial_trace",
                 )
-                build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
-
-                rhs_blocks = []
-                for target_coord_dim, constraint in zip(target_dims, constraint_chunk):
-                    constraint_counts["representative"] += int(target_coord_dim)
-                    if constraint.representative_kind == "known_matrix":
-                        if enforce_known_values:
-                            rhs_blocks.append(known_coordinate_values[constraint.representative_name])
-                        else:
-                            rhs_blocks.append(
-                                known_representative_coordinate_vectors[constraint.representative_name]
-                            )
-                    else:
-                        rhs_blocks.append(auxiliary_coordinate_vectors[constraint.representative_name])
-
-                rhs_start = perf_counter()
-                rhs_coord = _stack_rhs_blocks(rhs_blocks, Expr, Matrix)
-                build_profile["representative_batch_rhs_stack_time"] += perf_counter() - rhs_start
-
-                lhs_terms = []
+                terms = []
                 for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
-                    zip(sector_triplets, tau_sector_coordinate_dims[source_name])
+                    zip(sector_maps, tau_sector_coordinate_dims[source_spec.name])
                 ):
                     if vals.size == 0:
                         continue
-                    matrix_start = perf_counter()
-                    batch_map = Matrix.sparse(int(row_offset), int(sector_dim), rows, cols, vals)
-                    build_profile["representative_batch_sparse_time"] += perf_counter() - matrix_start
-                    mul_start = perf_counter()
-                    lhs_terms.append(
-                        Expr.mul(batch_map, tau_sector_coordinate_vectors[source_name][sector_index])
+                    sector_map = Matrix.sparse(int(target_coord_dim), int(sector_dim), rows, cols, vals)
+                    terms.append(
+                        Expr.mul(
+                            sector_map,
+                            tau_sector_coordinate_vectors[source_spec.name][sector_index],
+                        )
                     )
-                    build_profile["representative_batch_mul_time"] += perf_counter() - mul_start
+                coord_expr = _sum_expr(terms, Expr)
+                build_profile["representative_direct_expr_time"] += perf_counter() - expr_start
+                cached = (int(target_coord_dim), coord_expr)
+                reduced_expr_cache[cache_key] = cached
+                return cached
 
-                sub_start = perf_counter()
-                difference = Expr.sub(_sum_expr(lhs_terms, Expr), rhs_coord)
-                build_profile["representative_batch_sub_time"] += perf_counter() - sub_start
-
-                emit_start = perf_counter()
-                M.constraint(
-                    f"rep_batch_{batch_index}_{chunk_index}_{source_name}",
-                    difference,
-                    Domain.equalsTo(0.0),
+            rep_items = list(grouped_representatives.items())
+            rep_iter = _progress_bar(
+                rep_items,
+                real_verbose,
+                "block step 4: direct representatives",
+                total=len(rep_items),
+            )
+            for rep_index, (representative_name, constraints_for_rep) in enumerate(rep_iter, start=1):
+                if real_verbose >= 2:
+                    _progress_log(
+                        real_verbose,
+                        2,
+                        f"  direct representative {rep_index}/{len(rep_items)} = {representative_name} "
+                        f"with {len(constraints_for_rep)} occurrences",
+                    )
+                representative = representative_lookup[representative_name]
+                anchor_constraint = constraints_for_rep[0]
+                anchor_source_spec = tau_variable_specs[anchor_constraint.source_variable_name]
+                anchor_coord_dim, anchor_coord = get_tau_reduced_coordinate_expr(
+                    anchor_source_spec,
+                    anchor_constraint.keep_positions,
                 )
-                build_profile["representative_constraint_emit_time"] += perf_counter() - emit_start
-        build_profile["representative_batch_assembly_time"] = perf_counter() - batch_start
+                expected_coord_dim = representative_coord_dims[representative_name]
+                if int(anchor_coord_dim) != int(expected_coord_dim):
+                    raise ValueError(
+                        f"Representative {representative_name} expected coordinate dimension "
+                        f"{expected_coord_dim}, got {anchor_coord_dim}."
+                    )
+                anchor_expr = real_symmetric_matrix_from_coordinate_expr(
+                    anchor_coord,
+                    representative.matrix_dim,
+                    Expr,
+                    Matrix,
+                )
+                if anchor_constraint.representative_kind == "known_matrix":
+                    known_representative_coordinate_vectors[representative_name] = anchor_coord
+                    known_representative_variables[representative_name] = anchor_expr
+                else:
+                    auxiliary_coordinate_vectors[representative_name] = anchor_coord
+                    auxiliary_variables[representative_name] = anchor_expr
+                build_profile["representative_direct_count"] += 1
+
+                for occurrence_index, constraint in enumerate(constraints_for_rep[1:], start=1):
+                    source_spec = tau_variable_specs[constraint.source_variable_name]
+                    current_coord_dim, current_coord = get_tau_reduced_coordinate_expr(
+                        source_spec,
+                        constraint.keep_positions,
+                    )
+                    if int(current_coord_dim) != int(anchor_coord_dim):
+                        raise ValueError(
+                            f"Representative {representative_name} coordinate mismatch: "
+                            f"{current_coord_dim} vs {anchor_coord_dim}."
+                        )
+                    sub_start = perf_counter()
+                    difference = Expr.sub(current_coord, anchor_coord)
+                    build_profile["representative_batch_sub_time"] += perf_counter() - sub_start
+                    emit_start = perf_counter()
+                    M.constraint(
+                        f"rep_direct_{rep_index}_{occurrence_index}_{representative_name}",
+                        difference,
+                        Domain.equalsTo(0.0),
+                    )
+                    build_profile["representative_direct_emit_time"] += perf_counter() - emit_start
+                    constraint_counts["representative"] += int(anchor_coord_dim)
+            build_profile["representative_unique_canonical_maps"] = len(reduced_expr_cache)
+            build_profile["representative_batch_assembly_time"] = perf_counter() - batch_start
+        else:
+            grouped_representatives = defaultdict(list)
+            unique_canonical_maps = {}
+            for constraint in representative_constraints:
+                source_spec = tau_variable_specs[constraint.source_variable_name]
+                grouped_representatives[constraint.source_variable_name].append(constraint)
+                canonical_positions, _transport_rows, _transport_signs = _canonicalize_source_positions(
+                    source_spec,
+                    constraint.keep_positions,
+                    "partial_trace",
+                )
+                unique_canonical_maps[
+                    (
+                        _source_layout_signature(source_spec),
+                        canonical_positions,
+                    )
+                ] = source_spec
+
+            build_profile["representative_unique_canonical_maps"] = len(unique_canonical_maps)
+            build_profile["representative_source_batches"] = len(grouped_representatives)
+
+            precompile_start = perf_counter()
+            if len(unique_canonical_maps) <= _GLOBAL_PRECOMPILE_CANONICAL_MAP_LIMIT:
+                precompile_iter = _progress_bar(
+                    list(unique_canonical_maps.items()),
+                    real_verbose,
+                    "block step 4a: compile canonical maps",
+                    total=len(unique_canonical_maps),
+                )
+                for (
+                    _source_signature,
+                    canonical_positions,
+                ), source_spec in precompile_iter:
+                    _compile_canonical_tau_sector_triplets(source_spec, canonical_positions, "partial_trace")
+            build_profile["representative_precompile_time"] = perf_counter() - precompile_start
+
+            batch_start = perf_counter()
+            group_items = list(grouped_representatives.items())
+            rep_iter = _progress_bar(
+                group_items,
+                real_verbose,
+                "block step 4b: representative batches",
+                total=len(group_items),
+            )
+            for batch_index, (source_name, constraints_for_source) in enumerate(rep_iter, start=1):
+                if real_verbose >= 2:
+                    _progress_log(
+                        real_verbose,
+                        2,
+                            f"  representative batch {batch_index}/{len(group_items)} for {source_name} "
+                            f"with {len(constraints_for_source)} blocks",
+                    )
+                source_spec = tau_variable_specs[source_name]
+                constraint_chunks = _chunk_representative_constraints(
+                    constraints_for_source,
+                    representative_coord_dims,
+                    constraint_nnz_fn=lambda constraint, _source_spec=source_spec: get_cached_tau_sector_linear_map_nnz(
+                        _source_spec,
+                        constraint.keep_positions,
+                        "partial_trace",
+                    ),
+                )
+                build_profile["representative_chunk_count"] += len(constraint_chunks)
+                for chunk_index, constraint_chunk in enumerate(constraint_chunks, start=1):
+                    compile_start = perf_counter()
+                    row_offset, sector_triplets, target_dims = get_cached_representative_sector_batch_triplets(
+                        source_spec,
+                        constraint_chunk,
+                    )
+                    build_profile["representative_batch_triplet_time"] += perf_counter() - compile_start
+
+                    rhs_blocks = []
+                    for target_coord_dim, constraint in zip(target_dims, constraint_chunk):
+                        constraint_counts["representative"] += int(target_coord_dim)
+                        if constraint.representative_kind == "known_matrix":
+                            rhs_blocks.append(
+                                known_representative_coordinate_vectors[constraint.representative_name]
+                            )
+                        else:
+                            rhs_blocks.append(auxiliary_coordinate_vectors[constraint.representative_name])
+
+                    rhs_start = perf_counter()
+                    rhs_coord = _stack_rhs_blocks(rhs_blocks, Expr, Matrix)
+                    build_profile["representative_batch_rhs_stack_time"] += perf_counter() - rhs_start
+
+                    lhs_terms = []
+                    for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
+                        zip(sector_triplets, tau_sector_coordinate_dims[source_name])
+                    ):
+                        if vals.size == 0:
+                            continue
+                        matrix_start = perf_counter()
+                        batch_map = Matrix.sparse(int(row_offset), int(sector_dim), rows, cols, vals)
+                        build_profile["representative_batch_matrix_time"] += perf_counter() - matrix_start
+                        mul_start = perf_counter()
+                        lhs_terms.append(
+                            Expr.mul(batch_map, tau_sector_coordinate_vectors[source_name][sector_index])
+                        )
+                        build_profile["representative_batch_mul_time"] += perf_counter() - mul_start
+
+                    sub_start = perf_counter()
+                    difference = Expr.sub(_sum_expr(lhs_terms, Expr), rhs_coord)
+                    build_profile["representative_batch_sub_time"] += perf_counter() - sub_start
+
+                    emit_start = perf_counter()
+                    M.constraint(
+                        f"rep_batch_{batch_index}_{chunk_index}_{source_name}",
+                        difference,
+                        Domain.equalsTo(0.0),
+                    )
+                    build_profile["representative_constraint_emit_time"] += perf_counter() - emit_start
+                # Bound memory growth on large builds. Structural reuse still comes
+                # from the persistent canonical-map cache.
+                compiled_triplet_maps.clear()
+                compiled_sector_triplet_maps.clear()
+            build_profile["representative_batch_assembly_time"] = perf_counter() - batch_start
         _progress_log(
             real_verbose,
             1,
@@ -2596,16 +3357,159 @@ def build_block_fusion_feasibility_model(
         _progress_log(
             real_verbose,
             1,
-            f"Fusion block step 5/5: adding {len(active_ppt_constraints)} PPT blocks...",
+            f"Fusion block step 5/5: adding "
+            f"{len(active_ppt_constraints) + len(direct_ppt_constraints)} PPT blocks...",
         )
         tau_variable_specs = {variable.name: variable for variable in model.psd_variables}
         source_free_variable_lookup = {}
         source_free_variable_lookup.update(auxiliary_coordinate_vectors)
         source_free_variable_lookup.update(known_representative_coordinate_vectors)
+        if direct_ppt_constraints:
+            direct_stride = _progress_stride(len(direct_ppt_constraints))
+            for direct_index, constraint in enumerate(direct_ppt_constraints, start=1):
+                if real_verbose >= 2 and (
+                    direct_index == 1
+                    or direct_index % direct_stride == 0
+                    or direct_index == len(direct_ppt_constraints)
+                ):
+                    _progress_log(
+                        real_verbose,
+                        2,
+                        f"  direct real PPT {direct_index}/{len(direct_ppt_constraints)} "
+                        f"for {constraint.source_variable_name}",
+                    )
+                coord_dim = constraint.matrix_dim * (constraint.matrix_dim + 1) // 2
+                if constraint.source_variable_name in tau_sector_coordinate_vectors:
+                    source_spec = tau_variable_specs[constraint.source_variable_name]
+                    target_coord_dim, sector_maps = get_cached_tau_sector_linear_map_triplets(
+                        source_spec,
+                        constraint.transpose_positions,
+                        "partial_transpose",
+                    )
+                    if int(target_coord_dim) != coord_dim:
+                        raise ValueError(
+                            "Direct tau PPT expects real symmetric coordinates "
+                            f"of size {coord_dim}, got {target_coord_dim}."
+                        )
+                    select_start = perf_counter()
+                    restricted_sector_maps = _restrict_sector_triplets_to_row_lookup(
+                        sector_maps,
+                        direct_tau_ppt_row_lookups[constraint.ppt_variable_name],
+                    )
+                    build_profile["ppt_direct_tau_select_time"] += perf_counter() - select_start
+
+                    orbit_coord_dim = int(ppt_coordinate_dims[constraint.ppt_variable_name])
+                    emit_row_ranges = _iter_emit_row_ranges(orbit_coord_dim, _PPT_MAX_ROWS_PER_EMIT)
+                    build_profile["ppt_emit_slice_count"] += len(emit_row_ranges)
+                    for emit_index, (row_start, row_stop) in enumerate(emit_row_ranges, start=1):
+                        lhs_sector_triplets = _slice_sector_triplets(
+                            direct_tau_ppt_sector_maps[constraint.ppt_variable_name],
+                            row_start,
+                            row_stop,
+                        )
+                        lhs_terms = []
+                        for (rows, cols, vals), sector_dim, sector_coord in zip(
+                            lhs_sector_triplets,
+                            direct_tau_ppt_sector_coordinate_dims[constraint.ppt_variable_name],
+                            direct_tau_ppt_sector_coordinate_vectors[constraint.ppt_variable_name],
+                        ):
+                            if vals.size == 0:
+                                continue
+                            lhs_map = Matrix.sparse(
+                                int(row_stop - row_start),
+                                int(sector_dim),
+                                rows,
+                                cols,
+                                vals,
+                            )
+                            lhs_terms.append(Expr.mul(lhs_map, sector_coord))
+                        lhs_coord = _sum_expr(lhs_terms, Expr)
+                        rhs_terms = []
+                        sliced_sector_maps = _slice_sector_triplets(
+                            restricted_sector_maps,
+                            row_start,
+                            row_stop,
+                        )
+                        for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
+                            zip(sliced_sector_maps, tau_sector_coordinate_dims[constraint.source_variable_name])
+                        ):
+                            if vals.size == 0:
+                                continue
+                            mul_start = perf_counter()
+                            sector_map = Matrix.sparse(
+                                int(row_stop - row_start),
+                                int(sector_dim),
+                                rows,
+                                cols,
+                                vals,
+                            )
+                            rhs_terms.append(
+                                Expr.mul(
+                                    sector_map,
+                                    tau_sector_coordinate_vectors[constraint.source_variable_name][sector_index],
+                                )
+                            )
+                            build_profile["ppt_direct_mul_time"] += perf_counter() - mul_start
+                            build_profile["ppt_direct_tau_mul_time"] += perf_counter() - mul_start
+
+                        emit_start = perf_counter()
+                        M.constraint(
+                            f"ppt_direct_{direct_index}_{emit_index}_{constraint.source_variable_name}",
+                            Expr.sub(lhs_coord, _sum_expr(rhs_terms, Expr)),
+                            Domain.equalsTo(0.0),
+                        )
+                        build_profile["ppt_direct_emit_time"] += perf_counter() - emit_start
+                        build_profile["ppt_direct_tau_emit_time"] += perf_counter() - emit_start
+                    build_profile["ppt_direct_count"] += 1
+                    build_profile["ppt_direct_tau_count"] += 1
+                    constraint_counts["ppt_direct"] += 1
+                    continue
+                else:
+                    source_coord = source_free_variable_lookup[constraint.source_variable_name]
+                    target_coord_dim, linear_map = get_cached_free_partial_transpose_map(
+                        constraint.slot_dims,
+                        constraint.transpose_positions,
+                        int(source_coord.getShape()[0]),
+                    )
+                    if int(target_coord_dim) != coord_dim:
+                        raise ValueError(
+                            "Direct reduced PPT expects real symmetric coordinates "
+                            f"of size {coord_dim}, got {target_coord_dim}."
+                        )
+                    mul_start = perf_counter()
+                    ppt_coordinate_expr = Expr.mul(linear_map, source_coord)
+                    build_profile["ppt_direct_mul_time"] += perf_counter() - mul_start
+                    build_profile["ppt_direct_reduced_mul_time"] += perf_counter() - mul_start
+                    svec_start = perf_counter()
+                    ppt_svec_expr = real_svec_expr_from_coordinate_expr(
+                        ppt_coordinate_expr,
+                        constraint.matrix_dim,
+                        Expr,
+                        Matrix,
+                    )
+                    build_profile["ppt_direct_svec_time"] += perf_counter() - svec_start
+                    build_profile["ppt_direct_reduced_svec_time"] += perf_counter() - svec_start
+
+                emit_start = perf_counter()
+                M.constraint(
+                    f"ppt_direct_{direct_index}_{constraint.source_variable_name}",
+                    Expr.sub(
+                        direct_ppt_coordinate_vectors[constraint.ppt_variable_name],
+                        ppt_svec_expr,
+                    ),
+                    Domain.equalsTo(0.0),
+                )
+                build_profile["ppt_direct_emit_time"] += perf_counter() - emit_start
+                build_profile["ppt_direct_reduced_emit_time"] += perf_counter() - emit_start
+                build_profile["ppt_direct_count"] += 1
+                build_profile["ppt_direct_reduced_count"] += 1
+                constraint_counts["ppt_direct"] += 1
         grouped_ppt_constraints = defaultdict(list)
         for constraint in active_ppt_constraints:
             grouped_ppt_constraints[constraint.source_variable_name].append(constraint)
-        build_profile["ppt_source_batches"] = len(grouped_ppt_constraints)
+        build_profile["ppt_source_batches"] = (
+            len(grouped_ppt_constraints) + len({c.source_variable_name for c in direct_ppt_constraints})
+        )
 
         ppt_group_items = list(grouped_ppt_constraints.items())
         ppt_iter = _progress_bar(
@@ -2629,6 +3533,10 @@ def build_block_fusion_feasibility_model(
                 constraint_chunks = _chunk_constraint_blocks(
                     constraints_for_source,
                     block_rows_fn=lambda constraint: ppt_coordinate_dims[constraint.ppt_variable_name],
+                    max_blocks_per_chunk=_PPT_MAX_BLOCKS_PER_CHUNK,
+                    max_rows_per_chunk=_PPT_MAX_ROWS_PER_CHUNK,
+                    max_nnz_per_chunk=_PPT_MAX_NNZ_PER_CHUNK,
+                    max_dense_bytes_per_chunk=_PPT_MAX_DENSE_BYTES_PER_CHUNK,
                     constraint_nnz_fn=lambda constraint, _source_spec=source_spec: get_cached_tau_sector_linear_map_nnz(
                         _source_spec,
                         constraint.transpose_positions,
@@ -2649,40 +3557,60 @@ def build_block_fusion_feasibility_model(
                         lhs_blocks.append(ppt_coordinate_vectors[constraint.ppt_variable_name])
                         constraint_counts["ppt"] += int(target_coord_dim)
 
-                    lhs_start = perf_counter()
-                    lhs_coord = _stack_rhs_blocks(lhs_blocks, Expr, Matrix)
-                    build_profile["ppt_batch_rhs_stack_time"] += perf_counter() - lhs_start
-
-                    rhs_terms = []
-                    for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
-                        zip(sector_triplets, tau_sector_coordinate_dims[source_name])
-                    ):
-                        if vals.size == 0:
-                            continue
-                        matrix_start = perf_counter()
-                        batch_map = Matrix.sparse(int(row_offset), int(sector_dim), rows, cols, vals)
-                        build_profile["ppt_batch_matrix_time"] += perf_counter() - matrix_start
-                        mul_start = perf_counter()
-                        rhs_terms.append(
-                            Expr.mul(batch_map, tau_sector_coordinate_vectors[source_name][sector_index])
+                    emit_row_ranges = _iter_emit_row_ranges(row_offset, _PPT_MAX_ROWS_PER_EMIT)
+                    build_profile["ppt_emit_slice_count"] += len(emit_row_ranges)
+                    for emit_index, (row_start, row_stop) in enumerate(emit_row_ranges, start=1):
+                        lhs_start = perf_counter()
+                        lhs_coord = _slice_stacked_expr_blocks(
+                            lhs_blocks,
+                            target_dims,
+                            row_start,
+                            row_stop,
+                            Expr,
                         )
-                        build_profile["ppt_batch_mul_time"] += perf_counter() - mul_start
+                        build_profile["ppt_batch_rhs_stack_time"] += perf_counter() - lhs_start
 
-                    sub_start = perf_counter()
-                    difference = Expr.sub(lhs_coord, _sum_expr(rhs_terms, Expr))
-                    build_profile["ppt_batch_sub_time"] += perf_counter() - sub_start
+                        rhs_terms = []
+                        sliced_sector_triplets = _slice_sector_triplets(
+                            sector_triplets,
+                            row_start,
+                            row_stop,
+                        )
+                        for sector_index, ((rows, cols, vals), sector_dim) in enumerate(
+                            zip(sliced_sector_triplets, tau_sector_coordinate_dims[source_name])
+                        ):
+                            if vals.size == 0:
+                                continue
+                            matrix_start = perf_counter()
+                            batch_map = Matrix.sparse(int(row_stop - row_start), int(sector_dim), rows, cols, vals)
+                            build_profile["ppt_batch_matrix_time"] += perf_counter() - matrix_start
+                            mul_start = perf_counter()
+                            rhs_terms.append(
+                                Expr.mul(batch_map, tau_sector_coordinate_vectors[source_name][sector_index])
+                            )
+                            build_profile["ppt_batch_mul_time"] += perf_counter() - mul_start
 
-                    emit_start = perf_counter()
-                    M.constraint(
-                        f"ppt_batch_{batch_index}_{chunk_index}_{source_name}",
-                        difference,
-                        Domain.equalsTo(0.0),
-                    )
-                    build_profile["ppt_constraint_emit_time"] += perf_counter() - emit_start
+                        sub_start = perf_counter()
+                        difference = Expr.sub(lhs_coord, _sum_expr(rhs_terms, Expr))
+                        build_profile["ppt_batch_sub_time"] += perf_counter() - sub_start
+
+                        emit_start = perf_counter()
+                        M.constraint(
+                            f"ppt_batch_{batch_index}_{chunk_index}_{emit_index}_{source_name}",
+                            difference,
+                            Domain.equalsTo(0.0),
+                        )
+                        build_profile["ppt_constraint_emit_time"] += perf_counter() - emit_start
+                compiled_triplet_maps.clear()
+                compiled_sector_triplet_maps.clear()
             else:
                 constraint_chunks = _chunk_constraint_blocks(
                     constraints_for_source,
                     block_rows_fn=lambda constraint: ppt_coordinate_dims[constraint.ppt_variable_name],
+                    max_blocks_per_chunk=_PPT_MAX_BLOCKS_PER_CHUNK,
+                    max_rows_per_chunk=_PPT_MAX_ROWS_PER_CHUNK,
+                    max_nnz_per_chunk=_PPT_MAX_NNZ_PER_CHUNK,
+                    max_dense_bytes_per_chunk=_PPT_MAX_DENSE_BYTES_PER_CHUNK,
                 )
                 build_profile["ppt_chunk_count"] += len(constraint_chunks)
                 for chunk_index, constraint_chunk in enumerate(constraint_chunks, start=1):
@@ -2721,7 +3649,9 @@ def build_block_fusion_feasibility_model(
             real_verbose,
             1,
             "Fusion block step 5/5 complete: "
-            f"{constraint_counts['ppt']} scalar PPT constraints in {perf_counter() - step_start:.2f}s.",
+            f"{constraint_counts['ppt']} scalar PPT constraints, "
+            f"{constraint_counts['ppt_direct']} direct real PPT cones "
+            f"in {perf_counter() - step_start:.2f}s.",
         )
         build_profile["ppt_emit_time"] = perf_counter() - step_start
 
@@ -2740,6 +3670,9 @@ def build_block_fusion_feasibility_model(
         f"rep rhs-stack={build_profile['representative_batch_rhs_stack_time']:.2f}s, "
         f"rep batch-sub={build_profile['representative_batch_sub_time']:.2f}s, "
         f"rep emit={build_profile['representative_constraint_emit_time']:.2f}s, "
+        f"rep direct={build_profile['representative_direct_count']}, "
+        f"rep direct-expr={build_profile['representative_direct_expr_time']:.2f}s, "
+        f"rep direct-emit={build_profile['representative_direct_emit_time']:.2f}s, "
         f"rep chunks={build_profile['representative_chunk_count']}, "
         f"rep-batch hits(mem/disk/miss)="
         f"{build_profile['representative_batch_memory_hits']}/"
@@ -2753,6 +3686,21 @@ def build_block_fusion_feasibility_model(
         f"ppt batch-sub={build_profile['ppt_batch_sub_time']:.2f}s, "
         f"ppt emit={build_profile['ppt_constraint_emit_time']:.2f}s, "
         f"ppt chunks={build_profile['ppt_chunk_count']}, "
+        f"ppt emit-slices={build_profile['ppt_emit_slice_count']}, "
+        f"ppt direct-cones={build_profile['ppt_direct_count']}, "
+        f"ppt direct-mul={build_profile['ppt_direct_mul_time']:.2f}s, "
+        f"ppt direct-svec={build_profile['ppt_direct_svec_time']:.2f}s, "
+        f"ppt direct-emit={build_profile['ppt_direct_emit_time']:.2f}s, "
+        f"ppt direct-tau={build_profile['ppt_direct_tau_count']}, "
+        f"ppt tau-rows={build_profile['ppt_direct_tau_rows_full']}->"
+        f"{build_profile['ppt_direct_tau_rows_reduced']}, "
+        f"ppt tau-select={build_profile['ppt_direct_tau_select_time']:.2f}s, "
+        f"ppt tau-mul={build_profile['ppt_direct_tau_mul_time']:.2f}s, "
+        f"ppt tau-emit={build_profile['ppt_direct_tau_emit_time']:.2f}s, "
+        f"ppt direct-reduced={build_profile['ppt_direct_reduced_count']}, "
+        f"ppt reduced-mul={build_profile['ppt_direct_reduced_mul_time']:.2f}s, "
+        f"ppt reduced-svec={build_profile['ppt_direct_reduced_svec_time']:.2f}s, "
+        f"ppt reduced-emit={build_profile['ppt_direct_reduced_emit_time']:.2f}s, "
         f"tau-map hits(mem/disk/miss)="
         f"{build_profile['tau_map_memory_hits']}/"
         f"{build_profile['tau_map_disk_hits']}/"
@@ -2788,7 +3736,7 @@ def solve_block_fusion_feasibility(
     verbose: int = -1,
     include_ppt: bool = True,
     include_representatives: bool = True,
-    enforce_known_values: bool = True,
+    enforce_known_values: bool = False,
     Hermitian: bool = True,
 ) -> FusionSolveResult:
     """Build and solve the block-symmetrized GNME feasibility model."""

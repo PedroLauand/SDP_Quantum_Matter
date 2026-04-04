@@ -11,6 +11,7 @@ import numpy as np
 from sympy.combinatorics import Permutation, PermutationGroup
 from tqdm import tqdm
 from . import InflationProblem
+from .utils import ndarray_bytes_key
 
 def discover_distribution_symmetries(distribution: np.ndarray,
                                      scenario: InflationProblem
@@ -75,11 +76,11 @@ def discover_distribution_symmetries(distribution: np.ndarray,
             original_dag_monomials_lexboolvecs += [original_dag_lexboolvec]
             # Calculate its value under the distribution
             _value = distribution[(*outs, *ins)]
-            _hash = original_dag_lexboolvec.tobytes()
+            _hash = ndarray_bytes_key(original_dag_lexboolvec)
             original_dag_monomials_values[_hash] = _value
     original_dag_monomials_lexboolvecs = np.array(
                                              original_dag_monomials_lexboolvecs)
-    original_values_1d = np.array([original_dag_monomials_values[mon.tobytes()]
+    original_values_1d = np.array([original_dag_monomials_values[ndarray_bytes_key(mon)]
                                  for mon in original_dag_monomials_lexboolvecs])
     good_perms  = []
     for perm_lexorder in tqdm(scenario._all_possible_symmetries,
@@ -88,7 +89,7 @@ def discover_distribution_symmetries(distribution: np.ndarray,
         perm_orig   = lexperm_to_origperm(perm_lexorder, scenario)
         lexboolvecs = original_dag_monomials_lexboolvecs.copy()
         lexboolvecs = lexboolvecs[:, perm_orig]  # permute the columns
-        new_values_1d = np.array([original_dag_monomials_values[mon.tobytes()]
+        new_values_1d = np.array([original_dag_monomials_values[ndarray_bytes_key(mon)]
                                     for mon in lexboolvecs])
         if np.allclose(new_values_1d, original_values_1d):
             good_perms += [perm_lexorder]

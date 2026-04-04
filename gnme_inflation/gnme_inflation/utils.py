@@ -10,7 +10,7 @@ import numpy as np
 import scipy.sparse as sps
 
 from itertools import chain
-from typing import Any, Dict, Iterable, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from sys import stderr
 from operator import itemgetter
 from collections import deque
@@ -109,6 +109,12 @@ def partsextractor(thing_to_take_parts_of, indices) -> Tuple[int,...]:
             return itemgetter(*indices)(thing_to_take_parts_of)
     else:
         return itemgetter(indices)(thing_to_take_parts_of)
+
+
+def ndarray_bytes_key(array: np.ndarray,
+                      dtype: Optional[np.dtype] = None) -> bytes:
+    """Stable bytes key for array-shaped cache/hash lookups."""
+    return np.ascontiguousarray(np.asarray(array, dtype=dtype)).tobytes()
 
 
 def expand_sparse_vec(sparse_vec: sps.coo_array,

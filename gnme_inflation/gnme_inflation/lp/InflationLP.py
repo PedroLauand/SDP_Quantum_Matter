@@ -27,7 +27,7 @@ from .writer_utils import write_to_lp, write_to_mps
 from ..sdp.fast_npa import nb_is_knowable as is_knowable
 from ..sdp.quantum_tools import flatten_symbolic_powers
 from ..utils import clean_coefficients, eprint, partsextractor, \
-    expand_sparse_vec
+    expand_sparse_vec, ndarray_bytes_key
 
 
 class InflationLP(object):
@@ -1003,11 +1003,11 @@ class InflationLP(object):
         key = self.blank_bool_vec.copy()  # Quantum case will be different
         key[array1d] = True
         try:
-            return self._atomic_monomial_from_hash[key.tobytes()]
+            return self._atomic_monomial_from_hash[ndarray_bytes_key(key)]
         except KeyError:
             if len(self.lexorder_symmetries) == 1:
                 mon = InternalAtomicMonomial(self, array1d)
-                self._atomic_monomial_from_hash[key.tobytes()] = mon
+                self._atomic_monomial_from_hash[ndarray_bytes_key(key)] = mon
                 return mon
             else:
                 mon_as_symboolvec = key[self.lexorder_symmetries]
@@ -1017,7 +1017,7 @@ class InflationLP(object):
                 mon = InternalAtomicMonomial(self, 
                                              np.flatnonzero(mon_as_boolvec))
                 for alt_key in mon_as_symboolvec:
-                    self._atomic_monomial_from_hash[alt_key.tobytes()] = mon
+                    self._atomic_monomial_from_hash[ndarray_bytes_key(alt_key)] = mon
                 return mon
 
     def Monomial(self, array1d: np.ndarray, idx: int = -1) -> CompoundMoment:
@@ -1294,7 +1294,7 @@ class InflationLP(object):
         self.raw_n_columns = len(self._raw_monomials_as_lexboolvecs)
         self.raw_n_columns_non_CG = len(self._raw_monomials_as_lexboolvecs_non_CG)
 
-        self._raw_lookup_dict = {bitvec.tobytes(): i for i, bitvec in
+        self._raw_lookup_dict = {ndarray_bytes_key(bitvec): i for i, bitvec in
                                  enumerate(self._raw_monomials_as_lexboolvecs)}
 
         symmetrization_required = np.any(self.inflation_levels - 1)
@@ -1477,7 +1477,7 @@ class InflationLP(object):
                     signs = np.hstack((signs,1))
                     terms_as_boolvecs = np.vstack((terms_as_boolvecs, 
                                                    bool_vec))
-                    terms_as_rawidx = [self._raw_lookup_dict[boolvec.tobytes()] 
+                    terms_as_rawidx = [self._raw_lookup_dict[ndarray_bytes_key(boolvec)] 
                                        for boolvec in terms_as_boolvecs]
                     terms_as_idxs = self.inverse[terms_as_rawidx]
                     true_signs = np.power(-1, signs)
@@ -1545,7 +1545,7 @@ class InflationLP(object):
                 terms_as_boolvecs = np.bitwise_or(
                     absent_c_boolvec[np.newaxis],
                     adjustments)
-                terms_as_rawidx = [self._raw_lookup_dict[term_boolvec.tobytes()]
+                terms_as_rawidx = [self._raw_lookup_dict[ndarray_bytes_key(term_boolvec)]
                                    for term_boolvec in terms_as_boolvecs]
                 terms_as_idxs = self.inverse[terms_as_rawidx]
                 true_signs = np.power(-1, signs)
@@ -1555,7 +1555,7 @@ class InflationLP(object):
                 ineq_data.extend(true_signs.flat)
             else:
                 ineq_row.append(nof_inequalities)
-                ineq_col.append(self.inverse[self._raw_lookup_dict[bool_vec.tobytes()]])
+                ineq_col.append(self.inverse[self._raw_lookup_dict[ndarray_bytes_key(bool_vec)]])
                 ineq_data.append(1)
             nof_inequalities += 1
         return coo_array((ineq_data, (ineq_row, ineq_col)),
@@ -1681,7 +1681,7 @@ class InflationLP(object):
         nof_bitvecs_to_parse = len(_raw_monomials_as_lexboolvecs)
         if len(self.lexorder_symmetries) > 1:
             if not raw_hash_table:
-                hash_table = {bitvec.tobytes(): i for i, bitvec in
+                hash_table = {ndarray_bytes_key(bitvec): i for i, bitvec in
                               enumerate(_raw_monomials_as_lexboolvecs)}
             else:
                 hash_table = raw_hash_table
@@ -1694,9 +1694,9 @@ class InflationLP(object):
                 if orbits[i] == -1:
                     orbits[i] = i
                     initial = _raw_monomials_as_lexboolvecs[i]
-                    initial_hash = initial.tobytes()
+                    initial_hash = ndarray_bytes_key(initial)
                     variants = initial[non_identity_symmetries]
-                    variant_hashes = {variant.tobytes() for variant in variants}.difference({initial_hash})
+                    variant_hashes = {ndarray_bytes_key(variant) for variant in variants}.difference({initial_hash})
                     remaining_orbit = []
                     for variant_hash in variant_hashes:
                         try:

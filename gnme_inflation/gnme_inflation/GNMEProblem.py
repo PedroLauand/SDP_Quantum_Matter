@@ -15,13 +15,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
-from itertools import combinations, product
+from itertools import combinations, permutations, product
 from string import ascii_uppercase
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
 from .InflationProblem import InflationProblem
+from .utils import ndarray_bytes_key
 
 
 SubsetSignature = Tuple[
@@ -256,6 +257,76 @@ class GNMEProblem(InflationProblem):
         return self.n_parties * self.inflation_level
 
     @cached_property
+    def party_full_sequence_supports(self) -> Dict[str, Tuple[Tuple[int, ...], ...]]:
+        """All maximal nonfanout support patterns for each party.
+
+        In GNME the compatibility graph is block-diagonal across parties, so a
+        full inflation is obtained by choosing one maximal party pattern per
+        party and taking their union. For one party, maximality means that each
+        connected source copy appears exactly once across the chosen operators.
+        """
+        copy_range = tuple(range(1, self.inflation_level + 1))
+        base_permutations = tuple(permutations(copy_range))
+        label_to_index = {
+            label: index for index, label in enumerate(self.operator_lexorder)
+        }
+        supports_by_party: Dict[str, Tuple[Tuple[int, ...], ...]] = {}
+
+        for party in self.party_names:
+            labels = tuple(self.copy_labels_by_party[party])
+            if not labels:
+                supports_by_party[party] = tuple()
+                continue
+
+            connected_sources = tuple(
+                source for source in self.source_names
+                if source in self.label_source_copies[labels[0]]
+            )
+            label_lookup = {
+                tuple(self.label_source_copies[label][source] for source in connected_sources):
+                label_to_index[label]
+                for label in labels
+            }
+
+            party_supports = []
+            for other_permutations in product(
+                base_permutations,
+                repeat=max(0, len(connected_sources) - 1),
+            ):
+                support = []
+                for ref_copy in copy_range:
+                    key = [ref_copy]
+                    for permutation in other_permutations:
+                        key.append(permutation[ref_copy - 1])
+                    support.append(label_lookup[tuple(key)])
+                party_supports.append(tuple(sorted(support)))
+            supports_by_party[party] = tuple(party_supports)
+
+        return supports_by_party
+
+    @cached_property
+    def full_nonfanout_sequences_as_supports(self) -> np.ndarray:
+        """Full GNME inflations as fixed-width sorted supports."""
+        per_party_supports = [
+            self.party_full_sequence_supports[party]
+            for party in self.party_names
+        ]
+        if not per_party_supports or any(len(supports) == 0 for supports in per_party_supports):
+            return np.empty((0, self.full_sequence_size), dtype=np.int32)
+
+        sequence_count = int(np.prod([len(supports) for supports in per_party_supports], dtype=np.int64))
+        full_supports = np.empty((sequence_count, self.full_sequence_size), dtype=np.int32)
+        for row, combination in enumerate(product(*per_party_supports)):
+            merged_support = np.fromiter(
+                (index for party_support in combination for index in party_support),
+                dtype=np.int32,
+                count=self.full_sequence_size,
+            )
+            merged_support.sort()
+            full_supports[row] = merged_support
+        return full_supports
+
+    @cached_property
     def _lp_nonfanout(self):
         """Native LP helper used only to enumerate allowed nonfanout sequences.
 
@@ -279,21 +350,34 @@ class GNMEProblem(InflationProblem):
 
     @cached_property
     def raw_nonfanout_sequences_as_boolvecs(self) -> np.ndarray:
-        """All raw allowed nonfanout sequences before symmetry reduction."""
+        """Legacy all-length nonfanout sequence generator.
+
+        The GNME SDP pipeline now uses the maximal-template support path
+        directly. This property is kept for compatibility with older probes.
+        """
         return self._lp_nonfanout._raw_monomials_as_lexboolvecs.copy()
 
     @cached_property
     def full_nonfanout_sequences_as_boolvecs(self) -> np.ndarray:
-        """Raw nonfanout sequences with exactly ``n_parties * inflation_level`` operators.
+        """Full GNME inflations as dense boolvecs.
 
-        These are the full GNME inflations, as opposed to their proper subsets.
+        Dense boolvecs are preserved for compatibility, but the internal GNME
+        combinatorial path now works from fixed-width support rows.
         """
-        raw = self.raw_nonfanout_sequences_as_boolvecs
-        return raw[np.count_nonzero(raw, axis=1) == self.full_sequence_size]
+        supports = self.full_nonfanout_sequences_as_supports
+        bitvecs = np.zeros((len(supports), self._nr_operators), dtype=bool)
+        if supports.size:
+            rows = np.repeat(np.arange(len(supports), dtype=np.int32), supports.shape[1])
+            bitvecs[rows, supports.reshape(-1)] = True
+        return bitvecs
+
+    def sequence_support_to_labels(self, support: np.ndarray) -> Tuple[str, ...]:
+        """Convert a support-index representation into readable labels."""
+        return tuple(self.operator_lexorder[i] for i in np.asarray(support, dtype=np.int32))
 
     def sequence_boolvec_to_labels(self, bitvec: np.ndarray) -> Tuple[str, ...]:
         """Convert a boolean support vector over the operator lexorder into labels."""
-        return tuple(self.operator_lexorder[i] for i in np.flatnonzero(bitvec))
+        return self.sequence_support_to_labels(np.flatnonzero(bitvec))
 
     def factorize_sequence_labels(self, labels: Tuple[str, ...]) -> Tuple[Tuple[str, ...], ...]:
         """Factorize a sequence into connected components using native inflation logic."""
@@ -615,50 +699,43 @@ class GNMEProblem(InflationProblem):
         return tuple(sorted(atomic_knowns))
 
     @staticmethod
-    def _orbit_of_bitvec(bitvec: np.ndarray,
-                         symmetries: np.ndarray,
-                         lookup: Dict[bytes, int]) -> Tuple[int, ...]:
-        """Return the full symmetry orbit of a sequence represented as a boolvec."""
-        orbit = set()
-        frontier = [bitvec]
-        seen_hashes = set()
-        while frontier:
-            current = frontier.pop()
-            current_hash = current.tobytes()
-            if current_hash in seen_hashes:
-                continue
-            seen_hashes.add(current_hash)
-            idx = lookup.get(current_hash)
-            if idx is not None:
-                orbit.add(idx)
-            for perm in symmetries:
-                moved = current[perm]
-                moved_hash = moved.tobytes()
-                moved_idx = lookup.get(moved_hash)
-                if moved_idx is not None and moved_hash not in seen_hashes:
-                    frontier.append(moved)
+    def _orbit_of_support(support: np.ndarray,
+                          symmetries: np.ndarray,
+                          lookup: Dict[bytes, int]) -> Tuple[int, ...]:
+        """Return the symmetry orbit of one fixed-width support row."""
+        moved_supports = np.sort(symmetries[:, support], axis=1).astype(np.int32, copy=False)
+        orbit = {
+            lookup[support_hash]
+            for support_hash in (
+                ndarray_bytes_key(moved, dtype=np.int32) for moved in moved_supports
+            )
+            if support_hash in lookup
+        }
         return tuple(sorted(orbit))
 
     @cached_property
     def full_nonfanout_sequence_orbits(self) -> Tuple[Tuple[Tuple[str, ...], ...], ...]:
         """Group the full nonfanout sequences into copy-index symmetry orbits."""
-        sequences = self.full_nonfanout_sequences_as_boolvecs
-        if len(sequences) == 0:
+        supports = self.full_nonfanout_sequences_as_supports
+        if len(supports) == 0:
             return tuple()
 
-        lookup = {bitvec.tobytes(): i for i, bitvec in enumerate(sequences)}
-        unseen = set(range(len(sequences)))
+        lookup = {
+            ndarray_bytes_key(support, dtype=np.int32): i
+            for i, support in enumerate(supports)
+        }
+        unseen = set(range(len(supports)))
         orbits = []
         while unseen:
             seed = min(unseen)
-            orbit_indices = self._orbit_of_bitvec(
-                sequences[seed],
+            orbit_indices = self._orbit_of_support(
+                supports[seed],
                 self.copy_only_symmetry_generators,
                 lookup,
             )
             unseen.difference_update(orbit_indices)
             orbit_labels = tuple(
-                self.sequence_boolvec_to_labels(sequences[i])
+                self.sequence_support_to_labels(supports[i])
                 for i in orbit_indices
             )
             orbit_labels = tuple(sorted(orbit_labels))
