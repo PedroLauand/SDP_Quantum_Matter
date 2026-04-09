@@ -19,7 +19,7 @@ import hashlib
 import os
 import pickle
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import combinations, product
 from pathlib import Path
@@ -28,7 +28,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
-from ..GNMEProblem import GNMESDPBlueprint, GNMEProblem
+from ..GNMEProblem import GNMESDPBlueprint, GNMEProblem, GNMETopDownBlueprint, GNMETopDownFamily
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +89,7 @@ class RepresentativeConstraintDraft:
     representative_lexorder: Tuple[str, ...]
     keep_positions: Tuple[int, ...]
     traced_positions: Tuple[int, ...]
+    target_slot_permutation: Tuple[int, ...] | None
     named_einsum_spec: str
     symbolic_einsum_spec: str
     occurrence_inflation_name: str
@@ -115,11 +116,127 @@ class StateSDPDraft:
     shared_marginal_constraints: Tuple[MarginalConstraintDraft, ...]
 
 
+# ---------------------------------------------------------------------------
+# Phase 1-3: Top-down draft enhancement dataclasses for anchor grouping
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CrossInflationConstraintGroupDraft:
+    """Canonical anchor + non-anchor tau routes for one representative."""
+    
+    representative_name: str
+    anchor_constraint: RepresentativeConstraintDraft
+    non_anchor_constraints: Tuple[RepresentativeConstraintDraft, ...]
+
+
+@dataclass(frozen=True)
+class TopDownStateSDPDraft:
+    """Fresh top-down GNME draft driven by maximal family metadata.
+
+    This object is solver-agnostic. The default supported anchored scope is:
+
+    - tau PSD variables,
+    - maximal shared families,
+    - fixed known families,
+    - tau-family anchor groups,
+    - PPT candidates (tau always, family PPT optional at build time).
+
+    Overlap-family instantiation is intentionally left out of the anchored
+    default path until the hierarchy is implemented cleanly end-to-end.
+    """
+
+    family_blueprint: GNMETopDownBlueprint
+    party_dims: Dict[str, int]
+    verbose: int
+    psd_variables: Tuple[PSDVariableDraft, ...]
+    internal_symmetry_constraints: Tuple[InternalSymmetryConstraintDraft, ...]
+    maximal_representatives: Tuple["SharedMarginalRepresentativeDraft", ...]
+    known_representatives: Tuple["SharedMarginalRepresentativeDraft", ...]
+    representative_links: Tuple["RepresentativeLinkDraft", ...]
+    tau_representative_constraints: Tuple[RepresentativeConstraintDraft, ...]
+    ppt_variables: Tuple["PPTVariableDraft", ...]
+    ppt_constraints: Tuple["PPTConstraintDraft", ...]
+    fixed_marginal_constraints: Tuple[MarginalConstraintDraft, ...]
+    cross_inflation_groups: Tuple[CrossInflationConstraintGroupDraft, ...] = tuple()
+    verified_at_draft_time: bool = False
+
+
+@dataclass(frozen=True)
+class PaperMarginalViewDraft:
+    """One direct submarginal view of an inflated paper-style state."""
+
+    source_variable_name: str
+    source_variable_kind: str
+    source_lexorder: Tuple[str, ...]
+    keep_positions: Tuple[int, ...]
+    traced_positions: Tuple[int, ...]
+    target_lexorder: Tuple[str, ...]
+    target_slot_permutation: Tuple[int, ...] | None
+    slot_dims: Tuple[int, ...]
+    matrix_dim: int
+    factorization: Tuple[Tuple[str, ...], ...]
+    occurrence_labels: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PaperObservedConstraintDraft:
+    """One direct observed marginal constraint in the paper-style draft."""
+
+    name: str
+    target_lexorder: Tuple[str, ...]
+    marginal_view: PaperMarginalViewDraft
+
+
+@dataclass(frozen=True)
+class PaperEqualityConstraintDraft:
+    """One direct marginal equality between two inflated states."""
+
+    name: str
+    lhs_view: PaperMarginalViewDraft
+    rhs_view: PaperMarginalViewDraft
+
+
+@dataclass(frozen=True)
+class PaperPPTConstraintDraft:
+    """One direct PPT constraint on a full state or selected submarginal."""
+
+    name: str
+    marginal_view: PaperMarginalViewDraft
+    transpose_positions: Tuple[int, ...]
+    complement_positions: Tuple[int, ...]
+    transpose_lexorder: Tuple[str, ...]
+    complement_lexorder: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PaperStateSDPDraft:
+    """Tripartite paper-style inflation draft for levels 2 and 3.
+
+    This draft follows the appendix formulation directly:
+
+    - a small number of inflated tau variables,
+    - explicit named marginal anchors/equalities,
+    - only the PPT conditions listed in the paper.
+    """
+
+    formulation_name: str
+    inflation_level: int
+    party_dims: Dict[str, int]
+    verbose: int
+    psd_variables: Tuple[PSDVariableDraft, ...]
+    internal_symmetry_constraints: Tuple[InternalSymmetryConstraintDraft, ...]
+    observed_constraints: Tuple["PaperObservedConstraintDraft", ...]
+    equality_constraints: Tuple["PaperEqualityConstraintDraft", ...]
+    ppt_constraints: Tuple["PaperPPTConstraintDraft", ...]
+    fixed_marginal_constraints: Tuple[MarginalConstraintDraft, ...] = tuple()
+    verified_at_draft_time: bool = False
+
+
 @dataclass(frozen=True)
 class AssignedStateSDPDraft:
     """State SDP draft with matrices attached to known representatives."""
 
-    model: StateSDPDraft
+    model: StateSDPDraft | TopDownStateSDPDraft | PaperStateSDPDraft
     known_values: Dict[str, "KnownValueAssignmentDraft"]
 
 
@@ -146,6 +263,51 @@ class SymmetricMatrixOrbitData:
     pair_to_orbit: Dict[Tuple[int, int], int]
 
 
+@lru_cache(maxsize=None)
+def _cached_upper_triangle_pairs(matrix_dim: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Row-major upper-triangle `(row, col)` pairs for one matrix dimension."""
+    rows, cols = np.triu_indices(matrix_dim)
+    return (
+        rows.astype(np.int32, copy=False),
+        cols.astype(np.int32, copy=False),
+    )
+
+
+@lru_cache(maxsize=None)
+def _cached_unique_basis_maps(
+    slot_dims: Tuple[int, ...],
+    local_symmetry_perms: Tuple[Tuple[int, ...], ...],
+) -> Tuple[np.ndarray, ...]:
+    """Unique basis-index permutation maps induced by the slot symmetries."""
+    seen = set()
+    basis_maps = []
+    for perm in local_symmetry_perms:
+        basis_map = _basis_permutation_map(slot_dims, perm)
+        if basis_map in seen:
+            continue
+        seen.add(basis_map)
+        basis_maps.append(np.asarray(basis_map, dtype=np.int32))
+    if not basis_maps:
+        dim = product_dim(slot_dims)
+        basis_maps.append(np.arange(dim, dtype=np.int32))
+    return tuple(basis_maps)
+
+
+def _upper_triangle_coordinate_indices(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    matrix_dim: int,
+) -> np.ndarray:
+    """Vectorized row-major upper-triangle coordinate indices."""
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    return (
+        rows * int(matrix_dim)
+        - rows * (rows - 1) // 2
+        + (cols - rows)
+    ).astype(np.int32, copy=False)
+
+
 def _canonical_keep_positions_orbit(
     keep_positions: Tuple[int, ...],
     local_symmetry_perms: Tuple[Tuple[int, ...], ...],
@@ -167,6 +329,46 @@ def _canonical_keep_positions_orbit(
     return min(orbit)
 
 
+def _quotient_representative_constraint_sequence(
+    constraints: Tuple[RepresentativeConstraintDraft, ...] | Iterable[RepresentativeConstraintDraft],
+    source_lookup: Dict[str, object],
+    use_source_symmetry: bool = True,
+) -> Tuple[RepresentativeConstraintDraft, ...]:
+    """Quotient a representative-constraint sequence by source symmetry orbits."""
+    constraints = tuple(constraints)
+    if not use_source_symmetry:
+        return constraints
+
+    kept_constraints = []
+    seen = set()
+    for constraint in constraints:
+        source_variable = source_lookup.get(constraint.source_variable_name)
+        local_symmetry_perms = getattr(source_variable, "local_symmetry_perms", tuple()) if source_variable is not None else tuple()
+        if (
+            source_variable is None
+            or not local_symmetry_perms
+        ):
+            key = (
+                constraint.source_variable_name,
+                constraint.representative_name,
+                constraint.keep_positions,
+            )
+        else:
+            key = (
+                constraint.source_variable_name,
+                constraint.representative_name,
+                _canonical_keep_positions_orbit(
+                    constraint.keep_positions,
+                    local_symmetry_perms,
+                ),
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        kept_constraints.append(constraint)
+    return tuple(kept_constraints)
+
+
 def quotient_representative_constraints(
     model: StateSDPDraft,
     use_source_symmetry: bool = True,
@@ -183,40 +385,18 @@ def quotient_representative_constraints(
         return model.representative_constraints
 
     variable_lookup = {variable.name: variable for variable in model.psd_variables}
-    kept_constraints = []
-    seen = set()
-    for constraint in model.representative_constraints:
-        source_variable = variable_lookup.get(constraint.source_variable_name)
-        if (
-            source_variable is None
-            or constraint.source_variable_kind != "tau"
-            or not source_variable.local_symmetry_perms
-        ):
-            key = (
-                constraint.source_variable_name,
-                constraint.representative_name,
-                constraint.keep_positions,
-            )
-        else:
-            key = (
-                constraint.source_variable_name,
-                constraint.representative_name,
-                _canonical_keep_positions_orbit(
-                    constraint.keep_positions,
-                    source_variable.local_symmetry_perms,
-                ),
-            )
-        if key in seen:
-            continue
-        seen.add(key)
-        kept_constraints.append(constraint)
-    return tuple(kept_constraints)
+    return _quotient_representative_constraint_sequence(
+        model.representative_constraints,
+        variable_lookup,
+        use_source_symmetry=True,
+    )
 
 
 def quotient_ppt_constraints(
-    model: StateSDPDraft,
+    model: StateSDPDraft | TopDownStateSDPDraft,
     use_source_symmetry: bool = True,
     drop_representative_constraints_implied_by_tau: bool = True,
+    drop_factor_reducible_representative_ppts: bool = True,
 ) -> Tuple[Tuple["PPTVariableDraft", ...], Tuple["PPTConstraintDraft", ...]]:
     """Remove PPT constraints duplicated by source-variable symmetries.
 
@@ -230,6 +410,10 @@ def quotient_ppt_constraints(
     and equality constraint. We keep the raw list when
     ``use_source_symmetry=False`` because the quotient is only safe once the
     source symmetry has actually been enforced in the SDP variable.
+
+    Optionally, reducible shared representatives (``mu_*`` with more than one
+    factor block) can be dropped completely from the PPT layer. This keeps only
+    the factor-irreducible representative operators as PPT sources.
     """
     if not use_source_symmetry:
         return model.ppt_variables, model.ppt_constraints
@@ -238,21 +422,33 @@ def quotient_ppt_constraints(
         variable.name: variable.local_symmetry_perms
         for variable in model.psd_variables
     }
+    if isinstance(model, TopDownStateSDPDraft):
+        representatives = model.maximal_representatives + model.known_representatives
+        representative_constraints = model.tau_representative_constraints
+        anchor_constraint_by_representative = {
+            group.representative_name: group.anchor_constraint
+            for group in model.cross_inflation_groups
+        }
+    else:
+        representatives = model.auxiliary_representatives + model.known_representatives
+        representative_constraints = model.representative_constraints
+        anchor_constraint_by_representative = {}
+
     source_symmetry_lookup.update(
         {
             representative.name: representative.local_symmetry_perms
-            for representative in (
-                model.auxiliary_representatives + model.known_representatives
-            )
+            for representative in representatives
         }
     )
     representative_lookup = {
         representative.name: representative
-        for representative in (model.auxiliary_representatives + model.known_representatives)
+        for representative in representatives
     }
-    anchor_constraint_by_representative = {}
-    for constraint in model.representative_constraints:
-        anchor_constraint_by_representative.setdefault(constraint.representative_name, constraint)
+    for constraint in representative_constraints:
+        anchor_constraint_by_representative.setdefault(
+            constraint.representative_name,
+            constraint,
+        )
 
     variable_lookup = {variable.name: variable for variable in model.psd_variables}
 
@@ -312,10 +508,22 @@ def quotient_ppt_constraints(
             return False
         return True
 
+    def _representative_ppt_is_factor_reducible(constraint: PPTConstraintDraft) -> bool:
+        representative = representative_lookup.get(constraint.source_variable_name)
+        if representative is None:
+            return False
+        return len(representative.factorization) > 1
+
     kept_constraints = []
     kept_variable_names = set()
     seen = set()
     for constraint in model.ppt_constraints:
+        if (
+            drop_factor_reducible_representative_ppts
+            and constraint.source_variable_kind == "mu"
+            and _representative_ppt_is_factor_reducible(constraint)
+        ):
+            continue
         if (
             drop_representative_constraints_implied_by_tau
             and constraint.source_variable_kind == "mu"
@@ -789,51 +997,43 @@ def symmetric_matrix_orbits(
     orbit is enough to parameterize the invariant matrix.
     """
     matrix_dim = product_dim(slot_dims)
-    upper_pairs = tuple(
-        (row, col)
-        for row in range(matrix_dim)
-        for col in range(row, matrix_dim)
-    )
-    seen_basis_maps = set()
-    basis_maps = []
-    for perm in local_symmetry_perms:
-        basis_map = _basis_permutation_map(slot_dims, perm)
-        if basis_map not in seen_basis_maps:
-            seen_basis_maps.add(basis_map)
-            basis_maps.append(basis_map)
+    pair_rows, pair_cols = _cached_upper_triangle_pairs(matrix_dim)
+    basis_maps = _cached_unique_basis_maps(slot_dims, local_symmetry_perms)
 
-    pair_to_orbit: Dict[Tuple[int, int], int] = {}
-    orbit_representatives: List[Tuple[int, int]] = []
-    unvisited = set(upper_pairs)
-    while unvisited:
-        seed = min(unvisited)
-        stack = [seed]
-        orbit = {seed}
-        unvisited.remove(seed)
-        while stack:
-            row, col = stack.pop()
-            for basis_map in basis_maps:
-                mapped_row = basis_map[row]
-                mapped_col = basis_map[col]
-                mapped_pair = (
-                    (mapped_row, mapped_col)
-                    if mapped_row <= mapped_col
-                    else (mapped_col, mapped_row)
-                )
-                if mapped_pair not in orbit:
-                    orbit.add(mapped_pair)
-                    if mapped_pair in unvisited:
-                        unvisited.remove(mapped_pair)
-                    stack.append(mapped_pair)
-        orbit_index = len(orbit_representatives)
-        representative = min(orbit)
-        orbit_representatives.append(representative)
-        for pair in orbit:
-            pair_to_orbit[pair] = orbit_index
+    canonical_rows = None
+    for basis_map in basis_maps:
+        mapped_rows = basis_map[pair_rows]
+        mapped_cols = basis_map[pair_cols]
+        ordered_rows = np.minimum(mapped_rows, mapped_cols)
+        ordered_cols = np.maximum(mapped_rows, mapped_cols)
+        mapped_upper_rows = _upper_triangle_coordinate_indices(
+            ordered_rows,
+            ordered_cols,
+            matrix_dim,
+        )
+        if canonical_rows is None:
+            canonical_rows = mapped_upper_rows
+        else:
+            canonical_rows = np.minimum(canonical_rows, mapped_upper_rows)
+
+    assert canonical_rows is not None
+    representative_rows, orbit_lookup = np.unique(canonical_rows, return_inverse=True)
+    orbit_representatives = tuple(
+        (int(pair_rows[row]), int(pair_cols[row]))
+        for row in representative_rows.astype(np.int64, copy=False)
+    )
+    pair_to_orbit = {
+        (int(row), int(col)): int(orbit_index)
+        for row, col, orbit_index in zip(
+            pair_rows,
+            pair_cols,
+            orbit_lookup.astype(np.int32, copy=False),
+        )
+    }
 
     return SymmetricMatrixOrbitData(
         matrix_dim=matrix_dim,
-        upper_triangular_entries=len(upper_pairs),
+        upper_triangular_entries=int(pair_rows.size),
         orbit_representatives=tuple(orbit_representatives),
         pair_to_orbit=pair_to_orbit,
     )
@@ -1077,6 +1277,15 @@ def build_sdp_draft(
     ppt_variables = []
     ppt_constraints = []
     fixed_constraints = []
+    max_known_arity = max(
+        (
+            len(occurrence.labels)
+            for variable in blueprint.variables
+            for occurrences in variable.fixed_known_marginals.values()
+            for occurrence in occurrences
+        ),
+        default=0,
+    )
     for variable_index, variable in enumerate(blueprint.variables, start=1):
         _progress_log(
             real_verbose,
@@ -1123,6 +1332,8 @@ def build_sdp_draft(
             ppt_constraints.append(ppt_constraint)
         for occurrences in variable.fixed_known_marginals.values():
             for occurrence in occurrences:
+                if len(occurrence.labels) < max_known_arity:
+                    continue
                 recipe = partial_trace_recipe(
                     variable.lexorder,
                     variable.slot_dims,
@@ -1165,17 +1376,19 @@ def build_sdp_draft(
     representative_constraints = []
     shared_constraints = []
     known_representatives_by_signature = {}
-    shared_stride = _progress_stride(len(blueprint.shared_subset_classes))
-    for class_index, subset_class in enumerate(blueprint.shared_subset_classes):
+    shared_subset_classes = blueprint.shared_subset_classes
+
+    shared_stride = _progress_stride(len(shared_subset_classes))
+    for class_index, subset_class in enumerate(shared_subset_classes):
         if real_verbose >= 2 and (
             class_index == 0
             or (class_index + 1) % shared_stride == 0
-            or class_index + 1 == len(blueprint.shared_subset_classes)
+            or class_index + 1 == len(shared_subset_classes)
         ):
             _progress_log(
                 real_verbose,
                 2,
-                f"  shared class {class_index + 1}/{len(blueprint.shared_subset_classes)}",
+                f"  shared class {class_index + 1}/{len(shared_subset_classes)}",
             )
         representative_occurrence = min(
             subset_class.occurrences,
@@ -1204,16 +1417,17 @@ def build_sdp_draft(
         shared_representatives.append(representative)
         if representative_kind == "aux_psd":
             auxiliary_representatives.append(representative)
-            for ppt_variable, ppt_constraint in ppt_constraints_for_object(
-                    variable_name=representative.name,
-                    variable_kind="mu",
-                    lexorder=representative.target_lexorder,
-                    slot_dims=representative.slot_dims,
-                    factorization=representative.factorization,
-                    prefix=f"{representative.name}_pt",
-                ):
-                ppt_variables.append(ppt_variable)
-                ppt_constraints.append(ppt_constraint)
+            if len(representative.factorization) == 1:
+                for ppt_variable, ppt_constraint in ppt_constraints_for_object(
+                        variable_name=representative.name,
+                        variable_kind="mu",
+                        lexorder=representative.target_lexorder,
+                        slot_dims=representative.slot_dims,
+                        factorization=representative.factorization,
+                        prefix=f"{representative.name}_pt",
+                    ):
+                    ppt_variables.append(ppt_variable)
+                    ppt_constraints.append(ppt_constraint)
         else:
             known_representatives.append(representative)
             known_representatives_by_signature[subset_class.signature] = representative
@@ -1241,6 +1455,7 @@ def build_sdp_draft(
                     representative_lexorder=representative.target_lexorder,
                     keep_positions=recipe.keep_positions,
                     traced_positions=recipe.traced_positions,
+                    target_slot_permutation=None,
                     named_einsum_spec=recipe.named_einsum_spec,
                     symbolic_einsum_spec=recipe.einsum_spec,
                     occurrence_inflation_name=occurrence.inflation_name,
@@ -1259,7 +1474,7 @@ def build_sdp_draft(
                     einsum_spec=recipe.einsum_spec,
                     named_einsum_spec=recipe.named_einsum_spec,
                     input_tensor_shape=recipe.input_tensor_shape,
-                        output_tensor_shape=recipe.output_tensor_shape,
+                    output_tensor_shape=recipe.output_tensor_shape,
                 )
             )
     _progress_log(
@@ -1344,6 +1559,7 @@ def build_sdp_draft(
                     representative_lexorder=representative.target_lexorder,
                     keep_positions=recipe.keep_positions,
                     traced_positions=recipe.traced_positions,
+                    target_slot_permutation=None,
                     named_einsum_spec=recipe.named_einsum_spec,
                     symbolic_einsum_spec=recipe.einsum_spec,
                     occurrence_inflation_name=occurrence.inflation_name,
@@ -1357,6 +1573,24 @@ def build_sdp_draft(
         f"{len(known_representatives)} known representatives total, "
         f"{len(representative_constraints)} representative equalities total "
         f"in {perf_counter() - step_start:.2f}s.",
+    )
+
+    (
+        auxiliary_representatives,
+        known_representatives,
+        shared_representatives,
+        representative_links,
+        representative_constraints,
+        ppt_variables,
+        ppt_constraints,
+    ) = _drop_dominated_known_representatives(
+        auxiliary_representatives=tuple(auxiliary_representatives),
+        known_representatives=tuple(known_representatives),
+        shared_representatives=tuple(shared_representatives),
+        representative_links=tuple(representative_links),
+        representative_constraints=tuple(representative_constraints),
+        ppt_variables=tuple(ppt_variables),
+        ppt_constraints=tuple(ppt_constraints),
     )
 
     draft = StateSDPDraft(
@@ -1387,12 +1621,1151 @@ def build_sdp_draft(
     return draft
 
 
+def _representative_from_top_down_family(
+    family: GNMETopDownFamily,
+    name: str,
+    kind: str,
+    is_fixed_known: bool,
+) -> SharedMarginalRepresentativeDraft:
+    return SharedMarginalRepresentativeDraft(
+        name=name,
+        signature=family.signature,
+        representative_occurrence=family.representative_occurrence,
+        target_lexorder=family.representative_occurrence.labels,
+        slot_dims=family.slot_dims,
+        matrix_dim=family.matrix_dim,
+        local_symmetry_perms=family.local_symmetry_perms,
+        factorization=family.factorization,
+        kind=kind,
+        is_fixed_known=is_fixed_known,
+        occurrence_count=family.occurrence_count,
+    )
+
+
+def _compute_tau_representative_anchors(
+    tau_representative_constraints: Tuple[RepresentativeConstraintDraft, ...],
+) -> Dict[str, Tuple[int, ...]]:
+    """Group tau representative routes by representative with a canonical anchor."""
+    def _constraint_sort_key(constraint: RepresentativeConstraintDraft) -> Tuple:
+        return (
+            str(constraint.occurrence_inflation_name),
+            tuple(constraint.occurrence_labels),
+            tuple(int(pos) for pos in constraint.keep_positions),
+            tuple(int(pos) for pos in constraint.traced_positions),
+            tuple(int(pos) for pos in constraint.target_slot_permutation or ()),
+        )
+
+    groups_by_representative: Dict[str, List[int]] = {}
+    for idx, constraint in enumerate(tau_representative_constraints):
+        rep_name = constraint.representative_name
+        if rep_name not in groups_by_representative:
+            groups_by_representative[rep_name] = []
+        groups_by_representative[rep_name].append(idx)
+
+    return {
+        rep: tuple(
+            sorted(
+                indices,
+                key=lambda idx: _constraint_sort_key(tau_representative_constraints[idx]),
+            )
+        )
+        for rep, indices in groups_by_representative.items()
+    }
+
+
+def _dominated_known_representative_names(
+    known_representatives: Tuple[SharedMarginalRepresentativeDraft, ...] | Iterable[SharedMarginalRepresentativeDraft],
+    representative_constraints: Tuple[RepresentativeConstraintDraft, ...] | Iterable[RepresentativeConstraintDraft],
+) -> set[str]:
+    """Known representatives implied by larger known anchors through one tau view.
+
+    If a smaller known representative and a larger known representative both
+    occur as marginals of the same source variable, then anchoring the larger
+    one already fixes the smaller one by partial trace of that source state.
+    """
+    known_representatives = tuple(known_representatives)
+    representative_constraints = tuple(representative_constraints)
+    if not known_representatives:
+        return set()
+
+    constraints_by_rep: Dict[str, List[RepresentativeConstraintDraft]] = {}
+    for constraint in representative_constraints:
+        constraints_by_rep.setdefault(constraint.representative_name, []).append(constraint)
+
+    dominated: set[str] = set()
+    for representative in known_representatives:
+        small_size = len(representative.target_lexorder)
+        for larger in known_representatives:
+            if len(larger.target_lexorder) <= small_size:
+                continue
+            if any(
+                small_constraint.source_variable_name == large_constraint.source_variable_name
+                and set(small_constraint.keep_positions).issubset(set(large_constraint.keep_positions))
+                for small_constraint in constraints_by_rep.get(representative.name, ())
+                for large_constraint in constraints_by_rep.get(larger.name, ())
+            ):
+                dominated.add(representative.name)
+                break
+    return dominated
+
+
+def _drop_dominated_known_representatives(
+    *,
+    auxiliary_representatives: Tuple[SharedMarginalRepresentativeDraft, ...],
+    known_representatives: Tuple[SharedMarginalRepresentativeDraft, ...],
+    shared_representatives: Tuple[SharedMarginalRepresentativeDraft, ...] | None,
+    representative_links: Tuple[RepresentativeLinkDraft, ...],
+    representative_constraints: Tuple[RepresentativeConstraintDraft, ...],
+    ppt_variables: Tuple[PPTVariableDraft, ...],
+    ppt_constraints: Tuple[PPTConstraintDraft, ...],
+) -> Tuple[
+    Tuple[SharedMarginalRepresentativeDraft, ...],
+    Tuple[SharedMarginalRepresentativeDraft, ...],
+    Tuple[SharedMarginalRepresentativeDraft, ...] | None,
+    Tuple[RepresentativeLinkDraft, ...],
+    Tuple[RepresentativeConstraintDraft, ...],
+    Tuple[PPTVariableDraft, ...],
+    Tuple[PPTConstraintDraft, ...],
+]:
+    """Remove dominated known representatives and all derived constraints."""
+    dominated = _dominated_known_representative_names(
+        known_representatives,
+        representative_constraints,
+    )
+    if not dominated:
+        return (
+            auxiliary_representatives,
+            known_representatives,
+            shared_representatives,
+            representative_links,
+            representative_constraints,
+            ppt_variables,
+            ppt_constraints,
+        )
+
+    new_auxiliary = tuple(auxiliary_representatives)
+    new_known = tuple(
+        representative
+        for representative in known_representatives
+        if representative.name not in dominated
+    )
+    if shared_representatives is None:
+        new_shared = None
+    else:
+        new_shared = tuple(
+            representative
+            for representative in shared_representatives
+            if representative.name not in dominated
+        )
+
+    new_links = tuple(
+        link
+        for link in representative_links
+        if link.representative_name not in dominated
+    )
+    new_constraints = tuple(
+        constraint
+        for constraint in representative_constraints
+        if constraint.representative_name not in dominated
+    )
+
+    return (
+        new_auxiliary,
+        new_known,
+        new_shared,
+        new_links,
+        new_constraints,
+        tuple(
+            candidate
+            for candidate in ppt_variables
+            if candidate.source_variable_name not in dominated
+        ),
+        tuple(
+            candidate
+            for candidate in ppt_constraints
+            if candidate.source_variable_name not in dominated
+        ),
+    )
+
+
+def build_top_down_sdp_draft(
+    problem: GNMEProblem,
+    subset_sizes: Tuple[int, ...] = (2, 3, 4),
+    local_dims_per_party: Dict[str, int] | Tuple[int, ...] | int | None = None,
+    include_overlap_families: bool = False,
+    verbose: int | None = None,
+) -> TopDownStateSDPDraft:
+    """Build the fresh top-down GNME draft from maximal-family metadata.
+
+    This keeps the current stable bottom-up builder untouched. The returned
+    object is the new structural target for the redesign:
+
+    - tau PSD variables and their internal symmetries,
+    - maximal shared families as first-class representatives,
+    - no instantiated overlap descendants in the default anchored path,
+    - fixed-only known families,
+    - PPT candidates on tau and maximal families.
+    """
+    if include_overlap_families:
+        raise NotImplementedError(
+            "The anchored top-down draft currently supports maximal and known "
+            "families only. Overlap-family instantiation is intentionally not "
+            "enabled in this default path yet."
+        )
+
+    real_verbose = _resolve_verbose(verbose, getattr(problem, "verbose", 0))
+    t0 = perf_counter()
+    _progress_log(real_verbose, 1, "Building GNME top-down family blueprint...")
+    family_blueprint = problem.top_down_family_blueprint(
+        subset_sizes=None,
+        min_occurrences=2,
+        min_inflations=2,
+        local_dims_per_party=local_dims_per_party,
+    )
+    variable_blueprint = problem.sdp_blueprint(
+        subset_sizes=subset_sizes,
+        include_known_marginals=True,
+        min_shared_occurrences=2,
+        min_shared_inflations=2,
+        local_dims_per_party=local_dims_per_party,
+    )
+    _progress_log(
+        real_verbose,
+        1,
+        "Top-down metadata ready: "
+        f"{len(family_blueprint.maximal_families)} maximal families, "
+        f"{len(family_blueprint.overlap_families)} overlap families, "
+        f"{len(family_blueprint.known_families)} known families "
+        f"in {perf_counter() - t0:.2f}s.",
+    )
+
+    psd_variables = []
+    internal_symmetry_constraints = []
+    fixed_constraints = []
+    ppt_variables = []
+    ppt_constraints = []
+    max_known_arity = max(
+        (
+            len(occurrence.labels)
+            for variable in variable_blueprint.variables
+            for occurrences in variable.fixed_known_marginals.values()
+            for occurrence in occurrences
+        ),
+        default=0,
+    )
+    for variable in variable_blueprint.variables:
+        psd_variables.append(
+            PSDVariableDraft(
+                name=variable.name,
+                lexorder=variable.lexorder,
+                slot_dims=variable.slot_dims,
+                matrix_dim=product_dim(variable.slot_dims),
+                local_symmetry_perms=variable.local_symmetry_perms,
+                factorization=variable.factorization,
+                fixed_known_marginals=variable.fixed_known_marginals,
+            )
+        )
+        for permutation in variable.local_symmetry_perms:
+            if permutation == tuple(range(len(variable.lexorder))):
+                continue
+            permuted_lexorder = tuple(variable.lexorder[pos] for pos in permutation)
+            internal_symmetry_constraints.append(
+                InternalSymmetryConstraintDraft(
+                    variable_name=variable.name,
+                    variable_kind="tau",
+                    lexorder=variable.lexorder,
+                    permutation=permutation,
+                    permuted_lexorder=permuted_lexorder,
+                    named_action=symmetry_action_named_spec(
+                        variable.lexorder,
+                        permutation,
+                    ),
+                )
+            )
+        for ppt_variable, ppt_constraint in ppt_constraints_for_object(
+            variable_name=variable.name,
+            variable_kind="tau",
+            lexorder=variable.lexorder,
+            slot_dims=variable.slot_dims,
+            factorization=variable.factorization,
+            prefix=f"{variable.name}_pt",
+        ):
+            ppt_variables.append(ppt_variable)
+            ppt_constraints.append(ppt_constraint)
+        for occurrences in variable.fixed_known_marginals.values():
+            for occurrence in occurrences:
+                if len(occurrence.labels) < max_known_arity:
+                    continue
+                recipe = partial_trace_recipe(
+                    variable.lexorder,
+                    variable.slot_dims,
+                    occurrence.positions,
+                )
+                fixed_constraints.append(
+                    MarginalConstraintDraft(
+                        variable_name=variable.name,
+                        keep_positions=recipe.keep_positions,
+                        traced_positions=recipe.traced_positions,
+                        target_lexorder=recipe.target_lexorder,
+                        output_dim=recipe.output_dim,
+                        equation_count=recipe.equation_count,
+                        terms_per_equation=recipe.terms_per_equation,
+                        einsum_spec=recipe.einsum_spec,
+                        named_einsum_spec=recipe.named_einsum_spec,
+                        input_tensor_shape=recipe.input_tensor_shape,
+                        output_tensor_shape=recipe.output_tensor_shape,
+                    )
+                )
+
+    tau_lookup = {variable.name: variable for variable in variable_blueprint.variables}
+
+    maximal_representatives = []
+    known_representatives = []
+    representative_links = []
+    tau_representative_constraints = []
+
+    for family_index, family in enumerate(family_blueprint.maximal_families):
+        representative = _representative_from_top_down_family(
+            family,
+            name=f"mu_td_{family_index}",
+            kind="aux_psd",
+            is_fixed_known=False,
+        )
+        maximal_representatives.append(representative)
+        for occurrence in family.occurrences:
+            representative_links.append(
+                RepresentativeLinkDraft(
+                    representative_name=representative.name,
+                    representative_kind=representative.kind,
+                    occurrence=occurrence,
+                )
+            )
+            source_variable = tau_lookup[f"tau_{occurrence.inflation_index}"]
+            recipe = partial_trace_recipe(
+                source_variable.lexorder,
+                source_variable.slot_dims,
+                occurrence.positions,
+            )
+            target_perm = problem.coarse_subset_alignment_permutation(
+                occurrence.signature,
+                family.representative_occurrence.signature,
+            )
+            if target_perm == tuple(range(len(target_perm))):
+                target_perm = None
+            tau_representative_constraints.append(
+                RepresentativeConstraintDraft(
+                    source_variable_name=source_variable.name,
+                    source_variable_kind="tau",
+                    source_lexorder=source_variable.lexorder,
+                    representative_name=representative.name,
+                    representative_kind=representative.kind,
+                    representative_lexorder=representative.target_lexorder,
+                    keep_positions=recipe.keep_positions,
+                    traced_positions=recipe.traced_positions,
+                    target_slot_permutation=target_perm,
+                    named_einsum_spec=recipe.named_einsum_spec,
+                    symbolic_einsum_spec=recipe.einsum_spec,
+                    occurrence_inflation_name=occurrence.inflation_name,
+                    occurrence_labels=occurrence.labels,
+                )
+            )
+        for ppt_variable, ppt_constraint in ppt_constraints_for_object(
+            variable_name=representative.name,
+            variable_kind="mu",
+            lexorder=representative.target_lexorder,
+            slot_dims=representative.slot_dims,
+            factorization=representative.factorization,
+            prefix=f"{representative.name}_pt",
+        ):
+            ppt_variables.append(ppt_variable)
+            ppt_constraints.append(ppt_constraint)
+
+    for family_index, family in enumerate(family_blueprint.known_families):
+        representative = _representative_from_top_down_family(
+            family,
+            name=f"nu_td_{family_index}",
+            kind="known_matrix",
+            is_fixed_known=True,
+        )
+        known_representatives.append(representative)
+        for occurrence in family.occurrences:
+            representative_links.append(
+                RepresentativeLinkDraft(
+                    representative_name=representative.name,
+                    representative_kind=representative.kind,
+                    occurrence=occurrence,
+                )
+            )
+            source_variable = tau_lookup[f"tau_{occurrence.inflation_index}"]
+            recipe = partial_trace_recipe(
+                source_variable.lexorder,
+                source_variable.slot_dims,
+                occurrence.positions,
+            )
+            target_perm = problem.coarse_subset_alignment_permutation(
+                occurrence.signature,
+                family.representative_occurrence.signature,
+            )
+            if target_perm == tuple(range(len(target_perm))):
+                target_perm = None
+            tau_representative_constraints.append(
+                RepresentativeConstraintDraft(
+                    source_variable_name=source_variable.name,
+                    source_variable_kind="tau",
+                    source_lexorder=source_variable.lexorder,
+                    representative_name=representative.name,
+                    representative_kind=representative.kind,
+                    representative_lexorder=representative.target_lexorder,
+                    keep_positions=recipe.keep_positions,
+                    traced_positions=recipe.traced_positions,
+                    target_slot_permutation=target_perm,
+                    named_einsum_spec=recipe.named_einsum_spec,
+                    symbolic_einsum_spec=recipe.einsum_spec,
+                    occurrence_inflation_name=occurrence.inflation_name,
+                    occurrence_labels=occurrence.labels,
+                )
+            )
+
+    tau_representative_constraints = list(
+        _quotient_representative_constraint_sequence(
+            tuple(tau_representative_constraints),
+            tau_lookup,
+            use_source_symmetry=True,
+        )
+    )
+
+    _unused_auxiliary, known_representatives, _, representative_links, tau_representative_constraints, _ppt_vars_unused, _ppt_cons_unused = _drop_dominated_known_representatives(
+        auxiliary_representatives=tuple(),
+        known_representatives=tuple(known_representatives),
+        shared_representatives=None,
+        representative_links=tuple(representative_links),
+        representative_constraints=tuple(tau_representative_constraints),
+        ppt_variables=tuple(),
+        ppt_constraints=tuple(),
+    )
+    maximal_representatives = tuple(maximal_representatives)
+
+    # Compute cross-inflation groups from the quotiented tau constraints.
+    tau_anchor_groups = _compute_tau_representative_anchors(tuple(tau_representative_constraints))
+    cross_inflation_groups = []
+    for rep_name, indices in sorted(tau_anchor_groups.items()):
+        if not indices:
+            continue
+        # First constraint is the anchor, rest are non-anchors
+        anchor_idx = indices[0]
+        non_anchor_indices = indices[1:]
+        anchor_constraint = tau_representative_constraints[anchor_idx]
+        non_anchor_constraints = tuple(
+            tau_representative_constraints[idx] for idx in non_anchor_indices
+        )
+        group = CrossInflationConstraintGroupDraft(
+            representative_name=rep_name,
+            anchor_constraint=anchor_constraint,
+            non_anchor_constraints=non_anchor_constraints,
+        )
+        cross_inflation_groups.append(group)
+
+    draft = TopDownStateSDPDraft(
+        family_blueprint=family_blueprint,
+        party_dims=family_blueprint.party_dims,
+        verbose=real_verbose,
+        psd_variables=tuple(psd_variables),
+        internal_symmetry_constraints=tuple(internal_symmetry_constraints),
+        maximal_representatives=tuple(maximal_representatives),
+        known_representatives=tuple(known_representatives),
+        representative_links=tuple(representative_links),
+        tau_representative_constraints=tuple(tau_representative_constraints),
+        ppt_variables=tuple(ppt_variables),
+        ppt_constraints=tuple(ppt_constraints),
+        fixed_marginal_constraints=tuple(fixed_constraints),
+        cross_inflation_groups=tuple(cross_inflation_groups),
+        verified_at_draft_time=False,
+    )
+    validation_stats = validate_top_down_draft(draft, verbose=0)
+    draft = replace(draft, verified_at_draft_time=(validation_stats["errors"] == 0))
+    _progress_log(
+        real_verbose,
+        1,
+        "Top-down GNME draft ready: "
+        f"{len(draft.psd_variables)} tau variables, "
+        f"{len(draft.maximal_representatives)} maximal representatives, "
+        f"{len(draft.known_representatives)} known representatives, "
+        f"{len(draft.tau_representative_constraints)} tau-family equalities, "
+        f"{len(draft.ppt_variables)} PPT candidates, "
+        f"validated={draft.verified_at_draft_time}.",
+    )
+    return draft
+
+
+def build_smaller_sdp_draft(
+    problem: GNMEProblem,
+    subset_sizes: Tuple[int, ...] = (2, 3, 4),
+    local_dims_per_party: Dict[str, int] | Tuple[int, ...] | int | None = None,
+    verbose: int | None = None,
+) -> TopDownStateSDPDraft:
+    """Build the maximal-family GNME draft used as the reduced package mode.
+
+    This is the smallest solver-facing package draft currently supported:
+    - maximal shared families only,
+    - maximal known anchors only,
+    - no non-maximal representative auxiliaries.
+    """
+    return build_top_down_sdp_draft(
+        problem,
+        subset_sizes=subset_sizes,
+        local_dims_per_party=local_dims_per_party,
+        include_overlap_families=False,
+        verbose=verbose,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Paper-style inflation draft
+# ---------------------------------------------------------------------------
+
+def _paper_labels_to_positions(
+    source_lexorder: Tuple[str, ...],
+    labels: Tuple[str, ...],
+) -> Tuple[int, ...]:
+    position_by_label = {label: index for index, label in enumerate(source_lexorder)}
+    try:
+        return tuple(int(position_by_label[label]) for label in labels)
+    except KeyError as exc:
+        raise ValueError(f"Label {exc.args[0]!r} not present in source lexorder.") from exc
+
+
+def _paper_marginal_view(
+    problem: GNMEProblem,
+    source_variable: PSDVariableDraft,
+    target_lexorder: Tuple[str, ...],
+    source_labels: Tuple[str, ...],
+    party_dims: Dict[str, int],
+) -> PaperMarginalViewDraft:
+    keep_positions = _paper_labels_to_positions(source_variable.lexorder, source_labels)
+    traced_positions = tuple(
+        position
+        for position in range(len(source_variable.lexorder))
+        if position not in keep_positions
+    )
+    try:
+        target_perm = problem.coarse_subset_alignment_permutation(
+            source_labels,
+            target_lexorder,
+        )
+    except ValueError:
+        target_perm = _paper_party_alignment_permutation(
+            tuple(source_labels),
+            tuple(target_lexorder),
+        )
+    if target_perm == tuple(range(len(target_perm))):
+        target_perm = None
+    slot_dims = tuple(int(party_dims[label.split("_", 1)[0]]) for label in target_lexorder)
+    return PaperMarginalViewDraft(
+        source_variable_name=source_variable.name,
+        source_variable_kind="tau",
+        source_lexorder=tuple(source_variable.lexorder),
+        keep_positions=keep_positions,
+        traced_positions=traced_positions,
+        target_lexorder=tuple(target_lexorder),
+        target_slot_permutation=target_perm,
+        slot_dims=slot_dims,
+        matrix_dim=product_dim(slot_dims),
+        factorization=tuple((label,) for label in target_lexorder),
+        occurrence_labels=tuple(source_labels),
+    )
+
+
+def _paper_party_alignment_permutation(
+    source_labels: Tuple[str, ...],
+    target_labels: Tuple[str, ...],
+) -> Tuple[int, ...]:
+    """Align slots by party-occurrence order, ignoring copy indices."""
+    source_tokens = []
+    source_counts: Dict[str, int] = {}
+    for label in source_labels:
+        party = label.split("_", 1)[0]
+        source_counts[party] = source_counts.get(party, 0) + 1
+        source_tokens.append((party, source_counts[party]))
+
+    target_tokens = []
+    target_counts: Dict[str, int] = {}
+    for label in target_labels:
+        party = label.split("_", 1)[0]
+        target_counts[party] = target_counts.get(party, 0) + 1
+        target_tokens.append((party, target_counts[party]))
+
+    if sorted(source_tokens) != sorted(target_tokens):
+        raise ValueError("Paper marginal labels do not share the same party-occurrence pattern.")
+
+    target_pos_by_token = {token: index for index, token in enumerate(target_tokens)}
+    return tuple(int(target_pos_by_token[token]) for token in source_tokens)
+
+
+def _paper_direct_ppt_constraint(
+    name: str,
+    marginal_view: PaperMarginalViewDraft,
+    transpose_positions: Tuple[int, ...],
+) -> PaperPPTConstraintDraft:
+    transpose_positions = tuple(int(pos) for pos in transpose_positions)
+    complement_positions = tuple(
+        index for index in range(len(marginal_view.target_lexorder)) if index not in transpose_positions
+    )
+    return PaperPPTConstraintDraft(
+        name=name,
+        marginal_view=marginal_view,
+        transpose_positions=transpose_positions,
+        complement_positions=complement_positions,
+        transpose_lexorder=tuple(marginal_view.target_lexorder[pos] for pos in transpose_positions),
+        complement_lexorder=tuple(marginal_view.target_lexorder[pos] for pos in complement_positions),
+    )
+
+
+def _paper_tripartite_role_variables(
+    variables: Tuple[PSDVariableDraft, ...],
+    inflation_level: int,
+) -> Dict[str, PSDVariableDraft]:
+    by_name = {variable.name: variable for variable in variables}
+    if inflation_level == 2:
+        if "tau_0" not in by_name or "tau_1" not in by_name:
+            raise ValueError("Paper level-2 draft expects tau_0 and tau_1.")
+        return {
+            "tau": by_name["tau_0"],
+            "gamma": by_name["tau_1"],
+        }
+    if inflation_level == 3:
+        by_symmetry = {len(variable.local_symmetry_perms): variable for variable in variables}
+        try:
+            return {
+                "sigma": by_symmetry[6],
+                "tau": by_symmetry[2],
+                "gamma": by_symmetry[3],
+            }
+        except KeyError as exc:
+            raise ValueError(
+                "Paper level-3 draft expects tau symmetries of orders 6, 2 and 3."
+            ) from exc
+    raise NotImplementedError("Paper-style draft currently supports only levels 2 and 3.")
+
+
+def _paper_ordered_occurrence_labels(
+    view: PaperMarginalViewDraft,
+) -> Tuple[str, ...]:
+    """Occurrence labels ordered by the target-slot convention."""
+    if view.target_slot_permutation is None:
+        return tuple(view.occurrence_labels)
+    ordered = [None] * len(view.occurrence_labels)
+    for source_index, target_index in enumerate(view.target_slot_permutation):
+        ordered[int(target_index)] = view.occurrence_labels[source_index]
+    if any(label is None for label in ordered):
+        raise ValueError("Paper marginal view permutation did not cover all target slots.")
+    return tuple(ordered)  # type: ignore[return-value]
+
+
+def _paper_view_key(
+    view: PaperMarginalViewDraft,
+) -> Tuple[str, Tuple[str, ...], Tuple[str, ...]]:
+    """Stable key for a paper marginal view in target-slot order."""
+    return (
+        str(view.source_variable_name),
+        tuple(view.target_lexorder),
+        _paper_ordered_occurrence_labels(view),
+    )
+
+
+def _paper_subview(
+    problem: GNMEProblem,
+    source_lookup: Dict[str, PSDVariableDraft],
+    party_dims: Dict[str, int],
+    view: PaperMarginalViewDraft,
+    subset_positions: Tuple[int, ...],
+) -> PaperMarginalViewDraft:
+    ordered_labels = _paper_ordered_occurrence_labels(view)
+    target_labels = tuple(view.target_lexorder[index] for index in subset_positions)
+    target_parties = tuple(label.split("_", 1)[0] for label in target_labels)
+    if len(set(target_parties)) != len(target_parties):
+        raise ValueError("Paper subview is not a one-copy-per-party known marginal.")
+    canonical_target = tuple(
+        f"{party}_11"
+        for party in problem.party_names
+        if party in set(target_parties)
+    )
+    return _paper_marginal_view(
+        problem,
+        source_lookup[view.source_variable_name],
+        canonical_target,
+        tuple(ordered_labels[index] for index in subset_positions),
+        party_dims,
+    )
+
+
+def _paper_symmetry_images(
+    problem: GNMEProblem,
+    source_lookup: Dict[str, PSDVariableDraft],
+    party_dims: Dict[str, int],
+    view: PaperMarginalViewDraft,
+) -> Tuple[PaperMarginalViewDraft, ...]:
+    source_variable = source_lookup[view.source_variable_name]
+    ordered_labels = _paper_ordered_occurrence_labels(view)
+    position_by_label = {label: index for index, label in enumerate(source_variable.lexorder)}
+    images = []
+    for permutation in source_variable.local_symmetry_perms:
+        permuted_labels = tuple(
+            source_variable.lexorder[permutation[position_by_label[label]]]
+            for label in ordered_labels
+        )
+        images.append(
+            _paper_marginal_view(
+                problem,
+                source_variable,
+                tuple(view.target_lexorder),
+                permuted_labels,
+                party_dims,
+            )
+        )
+    return tuple(images)
+
+
+def _paper_prune_nonmaximal_observed_constraints(
+    problem: GNMEProblem,
+    psd_variables: Tuple[PSDVariableDraft, ...],
+    observed_constraints: Tuple[PaperObservedConstraintDraft, ...] | Iterable[PaperObservedConstraintDraft],
+    equality_constraints: Tuple[PaperEqualityConstraintDraft, ...] | Iterable[PaperEqualityConstraintDraft],
+    party_dims: Dict[str, int],
+) -> Tuple[PaperObservedConstraintDraft, ...]:
+    """Keep only maximal observed anchors.
+
+    In the tripartite hierarchy, pairwise observed targets are redundant once
+    the corresponding tripartite anchors are generated. The paper-style draft
+    should therefore emit only maximal observed families and let the rest
+    follow from trace/equality/symmetry structure.
+    """
+    observed_constraints = tuple(observed_constraints)
+    if not observed_constraints:
+        return observed_constraints
+
+    observed_sizes = {len(constraint.target_lexorder) for constraint in observed_constraints}
+    if len(observed_sizes) <= 1:
+        return observed_constraints
+    max_size = max(observed_sizes)
+    return tuple(
+        constraint
+        for constraint in observed_constraints
+        if len(constraint.target_lexorder) == max_size
+    )
+
+
+def build_paper_sdp_draft(
+    problem: GNMEProblem,
+    subset_sizes: Tuple[int, ...] = (2, 3, 4),
+    local_dims_per_party: Dict[str, int] | Tuple[int, ...] | int | None = None,
+    verbose: int | None = None,
+) -> PaperStateSDPDraft:
+    """Build the appendix-style tripartite inflation draft for levels 2 and 3."""
+    if int(problem.n_parties) != 3:
+        raise NotImplementedError("Paper-style draft currently supports only 3 parties.")
+    if int(problem.inflation_level) not in {2, 3}:
+        raise NotImplementedError("Paper-style draft currently supports only levels 2 and 3.")
+
+    real_verbose = _resolve_verbose(verbose, getattr(problem, "verbose", 0))
+    variable_blueprint = problem.sdp_blueprint(
+        subset_sizes=subset_sizes,
+        include_known_marginals=True,
+        min_shared_occurrences=2,
+        min_shared_inflations=2,
+        local_dims_per_party=local_dims_per_party,
+    )
+    party_dims = dict(variable_blueprint.party_dims)
+
+    psd_variables = []
+    internal_symmetry_constraints = []
+    for variable in variable_blueprint.variables:
+        psd_variables.append(
+            PSDVariableDraft(
+                name=variable.name,
+                lexorder=variable.lexorder,
+                slot_dims=variable.slot_dims,
+                matrix_dim=product_dim(variable.slot_dims),
+                local_symmetry_perms=variable.local_symmetry_perms,
+                factorization=variable.factorization,
+                fixed_known_marginals=variable.fixed_known_marginals,
+            )
+        )
+        for permutation in variable.local_symmetry_perms:
+            if permutation == tuple(range(len(variable.lexorder))):
+                continue
+            internal_symmetry_constraints.append(
+                InternalSymmetryConstraintDraft(
+                    variable_name=variable.name,
+                    variable_kind="tau",
+                    lexorder=variable.lexorder,
+                    permutation=permutation,
+                    permuted_lexorder=tuple(variable.lexorder[pos] for pos in permutation),
+                    named_action=symmetry_action_named_spec(variable.lexorder, permutation),
+                )
+            )
+    psd_variables = tuple(psd_variables)
+    role_variables = _paper_tripartite_role_variables(psd_variables, int(problem.inflation_level))
+
+    observed_constraints: List[PaperObservedConstraintDraft] = []
+    equality_constraints: List[PaperEqualityConstraintDraft] = []
+    ppt_constraints: List[PaperPPTConstraintDraft] = []
+
+    def add_observed_view(
+        name: str,
+        source_variable: PSDVariableDraft,
+        source_labels: Tuple[str, ...],
+        target_lexorder: Tuple[str, ...],
+    ) -> None:
+        observed_constraints.append(
+            PaperObservedConstraintDraft(
+                name=name,
+                target_lexorder=tuple(target_lexorder),
+                marginal_view=_paper_marginal_view(
+                    problem,
+                    source_variable,
+                    tuple(target_lexorder),
+                    tuple(source_labels),
+                    party_dims,
+                ),
+            )
+        )
+
+    def add_known_occurrences(source_variable: PSDVariableDraft) -> None:
+        for occurrences in source_variable.fixed_known_marginals.values():
+            for occurrence in sorted(
+                occurrences,
+                key=lambda occ: (occ.positions, occ.labels),
+            ):
+                target_lexorder = tuple(
+                    f"{label.split('_', 1)[0]}_11"
+                    for label in occurrence.labels
+                )
+                name = f"rho_{source_variable.name}_{'__'.join(occurrence.labels)}"
+                add_observed_view(
+                    name,
+                    source_variable,
+                    tuple(occurrence.labels),
+                    target_lexorder,
+                )
+
+    def add_equality(
+        name: str,
+        lhs_role: str,
+        lhs_labels: Tuple[str, ...],
+        rhs_role: str,
+        rhs_labels: Tuple[str, ...],
+        target_lexorder: Tuple[str, ...] | None = None,
+    ) -> None:
+        target_lexorder = tuple(target_lexorder or lhs_labels)
+        equality_constraints.append(
+            PaperEqualityConstraintDraft(
+                name=name,
+                lhs_view=_paper_marginal_view(
+                    problem,
+                    role_variables[lhs_role],
+                    target_lexorder,
+                    tuple(lhs_labels),
+                    party_dims,
+                ),
+                rhs_view=_paper_marginal_view(
+                    problem,
+                    role_variables[rhs_role],
+                    target_lexorder,
+                    tuple(rhs_labels),
+                    party_dims,
+                ),
+            )
+        )
+
+    def add_ppt(
+        name: str,
+        role: str,
+        source_labels: Tuple[str, ...],
+        transpose_positions: Tuple[int, ...],
+        target_lexorder: Tuple[str, ...] | None = None,
+    ) -> None:
+        target_lexorder = tuple(target_lexorder or source_labels)
+        view = _paper_marginal_view(
+            problem,
+            role_variables[role],
+            target_lexorder,
+            tuple(source_labels),
+            party_dims,
+        )
+        ppt_constraints.append(
+            _paper_direct_ppt_constraint(name, view, tuple(transpose_positions))
+        )
+
+    for source_variable in psd_variables:
+        add_known_occurrences(source_variable)
+
+    if int(problem.inflation_level) == 2:
+
+        add_equality(
+            "eq_abab",
+            "gamma",
+            ("A_11", "B_11", "A_22", "B_22"),
+            "tau",
+            ("A_11", "B_11", "A_22", "B_22"),
+        )
+        add_equality(
+            "eq_bcbc",
+            "gamma",
+            ("B_11", "C_12", "B_22", "C_21"),
+            "tau",
+            ("B_11", "C_11", "B_22", "C_22"),
+        )
+        add_equality(
+            "eq_caca",
+            "gamma",
+            ("C_12", "A_22", "C_21", "A_11"),
+            "tau",
+            ("C_11", "A_11", "C_22", "A_22"),
+        )
+
+        add_ppt("ppt_gamma_b2", "gamma", ("A_11", "B_11", "C_12", "B_22"), (3,))
+        add_ppt("ppt_gamma_c2", "gamma", ("B_11", "C_12", "A_22", "C_21"), (3,))
+        add_ppt("ppt_gamma_a1", "gamma", ("C_12", "A_22", "B_22", "A_11"), (3,))
+        add_ppt("ppt_tau_full", "tau", tuple(role_variables["tau"].lexorder), (0, 2, 4))
+    else:
+        add_equality(
+            "eq_gamma_tau_0",
+            "gamma",
+            ("B_33", "C_31", "A_11", "B_11", "C_12", "B_22", "C_23"),
+            "tau",
+            ("B_22", "C_23", "A_11", "B_11", "C_11", "B_33", "C_32"),
+        )
+        add_equality(
+            "eq_gamma_tau_1",
+            "gamma",
+            ("C_31", "A_11", "B_11", "C_12", "A_22", "C_23", "A_33"),
+            "tau",
+            ("C_23", "A_11", "B_11", "C_11", "A_22", "C_32", "A_33"),
+        )
+        add_equality(
+            "eq_gamma_tau_2",
+            "gamma",
+            ("A_11", "B_11", "C_12", "A_22", "B_22", "A_33", "B_33"),
+            "tau",
+            ("A_11", "B_11", "C_11", "A_22", "B_22", "A_33", "B_33"),
+        )
+
+        add_equality(
+            "eq_tau_sigma_0",
+            "tau",
+            ("A_11", "B_11", "A_22", "B_22", "A_33", "B_33", "C_32"),
+            "sigma",
+            ("A_11", "B_11", "A_22", "B_22", "A_33", "B_33", "C_33"),
+        )
+        add_equality(
+            "eq_tau_sigma_1",
+            "tau",
+            ("B_11", "C_11", "B_22", "C_23", "A_33", "B_33", "C_32"),
+            "sigma",
+            ("B_11", "C_11", "B_22", "C_22", "A_33", "B_33", "C_33"),
+        )
+        add_equality(
+            "eq_tau_sigma_2",
+            "tau",
+            ("C_11", "A_22", "C_23", "A_11", "A_33", "B_33", "C_32"),
+            "sigma",
+            ("C_11", "A_11", "C_22", "A_22", "A_33", "B_33", "C_33"),
+        )
+
+        for name, labels, transpose_positions in (
+            ("ppt_gamma_a1", ("A_11", "C_12", "A_22", "B_22", "C_23", "A_33", "B_33"), (0,)),
+            ("ppt_gamma_b1", ("B_11", "A_22", "B_22", "C_23", "A_33", "B_33", "C_31"), (0,)),
+            ("ppt_gamma_c1", ("C_12", "B_22", "C_23", "A_33", "B_33", "C_31", "A_11"), (0,)),
+            ("ppt_gamma_a1b1c1", ("A_11", "B_11", "C_12", "B_22", "C_23", "A_33", "B_33"), (0, 1, 2)),
+            ("ppt_gamma_b1c1a2", ("B_11", "C_12", "A_22", "C_23", "A_33", "B_33", "C_31"), (0, 1, 2)),
+            ("ppt_gamma_c1a2b2", ("C_12", "A_22", "B_22", "A_33", "B_33", "C_31", "A_11"), (0, 1, 2)),
+        ):
+            add_ppt(name, "gamma", labels, transpose_positions)
+
+        for name, labels, transpose_positions in (
+            ("ppt_tau_a1", ("A_11", "C_11", "A_22", "B_22", "A_33", "B_33", "C_32"), (0,)),
+            ("ppt_tau_b1", ("B_11", "A_22", "B_22", "C_23", "A_33", "B_33", "C_32"), (0,)),
+            ("ppt_tau_c1", ("C_11", "B_22", "C_23", "A_11", "A_33", "B_33", "C_32"), (0,)),
+            ("ppt_tau_c1a2b2", ("A_11", "C_11", "A_22", "B_22", "A_33", "B_33", "C_32"), (1, 2, 3)),
+            ("ppt_tau_a2b2c2", ("B_11", "A_22", "B_22", "C_23", "A_33", "B_33", "C_32"), (1, 2, 3)),
+            ("ppt_tau_b2c2a1", ("C_11", "B_22", "C_23", "A_11", "A_33", "B_33", "C_32"), (1, 2, 3)),
+        ):
+            add_ppt(name, "tau", labels, transpose_positions)
+
+        add_ppt("ppt_tau_full", "tau", tuple(role_variables["tau"].lexorder), (2, 5, 8))
+        add_ppt("ppt_sigma_full", "sigma", tuple(role_variables["sigma"].lexorder), (0, 3, 6))
+
+    observed_constraints = list(
+        _paper_prune_nonmaximal_observed_constraints(
+            problem,
+            psd_variables,
+            tuple(observed_constraints),
+            tuple(equality_constraints),
+            party_dims,
+        )
+    )
+
+    draft = PaperStateSDPDraft(
+        formulation_name="paper",
+        inflation_level=int(problem.inflation_level),
+        party_dims=party_dims,
+        verbose=real_verbose,
+        psd_variables=psd_variables,
+        internal_symmetry_constraints=tuple(internal_symmetry_constraints),
+        observed_constraints=tuple(observed_constraints),
+        equality_constraints=tuple(equality_constraints),
+        ppt_constraints=tuple(ppt_constraints),
+        verified_at_draft_time=True,
+    )
+    _progress_log(
+        real_verbose,
+        1,
+        "Paper-style GNME draft ready: "
+        f"{len(draft.psd_variables)} tau variables, "
+        f"{len(draft.observed_constraints)} observed, "
+        f"{len(draft.equality_constraints)} equalities, "
+        f"{len(draft.ppt_constraints)} PPT constraints.",
+    )
+    return draft
+
+
+def validate_paper_draft(
+    draft: PaperStateSDPDraft,
+    verbose: int = 0,
+) -> Dict[str, int]:
+    """Validate the integrity of the paper-style draft."""
+    stats = {
+        "errors": 0,
+        "warnings": 0,
+        "constraints_checked": len(draft.equality_constraints),
+        "observed_constraints_checked": len(draft.observed_constraints),
+        "ppt_constraints_checked": len(draft.ppt_constraints),
+    }
+    observed_names = [constraint.name for constraint in draft.observed_constraints]
+    if len(set(observed_names)) != len(observed_names):
+        stats["errors"] += len(observed_names) - len(set(observed_names))
+    for constraint in draft.equality_constraints:
+        if constraint.lhs_view.matrix_dim != constraint.rhs_view.matrix_dim:
+            stats["errors"] += 1
+    for constraint in draft.ppt_constraints:
+        if len(constraint.transpose_positions) == 0:
+            stats["warnings"] += 1
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Draft validation
+# ---------------------------------------------------------------------------
+
+def validate_top_down_draft(
+    draft: TopDownStateSDPDraft,
+    verbose: int = 0,
+) -> Dict[str, int]:
+    """Validate the integrity of a top-down SDP draft.
+    
+    Checks that:
+    - all tau representative constraints are covered by anchor groups,
+    - every anchor group references a valid maximal or known representative,
+    - anchor/non-anchor representative names are consistent,
+    - the default anchored path does not silently instantiate overlaps.
+    
+    Returns a dictionary with validation statistics.
+    """
+    stats = {
+        'errors': 0,
+        'warnings': 0,
+        'constraints_checked': 0,
+        'cross_inflation_groups_checked': 0,
+    }
+    
+    expected_anchor_names = {
+        rep.name for rep in (draft.maximal_representatives + draft.known_representatives)
+    }
+    group_names = {group.representative_name for group in draft.cross_inflation_groups}
+
+    if group_names != expected_anchor_names:
+        missing = expected_anchor_names - group_names
+        extra = group_names - expected_anchor_names
+        if verbose >= 1 and missing:
+            _progress_log(verbose, 1, f"Error: missing anchor groups for {sorted(missing)}")
+        if verbose >= 1 and extra:
+            _progress_log(verbose, 1, f"Error: unexpected anchor groups for {sorted(extra)}")
+        stats['errors'] += len(missing) + len(extra)
+
+    total_constraints = len(draft.tau_representative_constraints)
+    stats['constraints_checked'] = total_constraints
+    
+    all_constraint_indices = set()
+    for group_idx, group in enumerate(draft.cross_inflation_groups):
+        stats['cross_inflation_groups_checked'] += 1
+        # Check anchor constraint is valid
+        anchor_idx = None
+        for idx, constraint in enumerate(draft.tau_representative_constraints):
+            if constraint is group.anchor_constraint:
+                anchor_idx = idx
+                break
+        
+        if anchor_idx is None:
+            if verbose >= 1:
+                _progress_log(
+                    verbose, 1,
+                    f"Error: Anchor constraint not found in group {group_idx}"
+                )
+            stats['errors'] += 1
+        else:
+            if group.anchor_constraint.representative_name != group.representative_name:
+                if verbose >= 1:
+                    _progress_log(
+                        verbose,
+                        1,
+                        f"Error: group {group_idx} anchor representative mismatch.",
+                    )
+                stats['errors'] += 1
+            all_constraint_indices.add(anchor_idx)
+        
+        # Check non-anchor constraints are valid
+        for non_anchor_constraint in group.non_anchor_constraints:
+            if non_anchor_constraint.representative_name != group.representative_name:
+                if verbose >= 1:
+                    _progress_log(
+                        verbose,
+                        1,
+                        f"Error: non-anchor representative mismatch in group {group_idx}.",
+                    )
+                stats['errors'] += 1
+            found = False
+            for idx, constraint in enumerate(draft.tau_representative_constraints):
+                if constraint is non_anchor_constraint:
+                    found = True
+                    all_constraint_indices.add(idx)
+                    break
+            if not found:
+                if verbose >= 1:
+                    _progress_log(
+                        verbose, 1,
+                        f"Error: Non-anchor constraint not found in group {group_idx}"
+                    )
+                stats['errors'] += 1
+    
+    # Check all constraints are referenced
+    if len(all_constraint_indices) != total_constraints:
+        missing = set(range(total_constraints)) - all_constraint_indices
+        if verbose >= 1:
+            _progress_log(
+                verbose, 1,
+                f"Error: {len(missing)} tau constraints not in any group: {missing}"
+            )
+        stats['errors'] += len(missing)
+    
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # Known-value assignment
 # ---------------------------------------------------------------------------
 
 def _known_representative_lookup(
-    model: StateSDPDraft,
+    model: StateSDPDraft | TopDownStateSDPDraft,
 ) -> Tuple[Dict[str, SharedMarginalRepresentativeDraft], Dict[Tuple[str, ...], SharedMarginalRepresentativeDraft]]:
     """Index known representatives by name and lexorder target."""
     by_name = {rep.name: rep for rep in model.known_representatives}
@@ -1401,7 +2774,7 @@ def _known_representative_lookup(
 
 
 def _resolve_known_value_key(
-    model: StateSDPDraft,
+    model: StateSDPDraft | TopDownStateSDPDraft,
     key,
 ) -> SharedMarginalRepresentativeDraft:
     """Resolve a human-readable key to a known representative.
@@ -1426,7 +2799,7 @@ def _resolve_known_value_key(
 
 
 def set_values(
-    model: StateSDPDraft,
+    model: StateSDPDraft | TopDownStateSDPDraft,
     values: Dict,
 ) -> AssignedStateSDPDraft:
     """Assign numeric matrices to known representatives.
@@ -2002,8 +3375,47 @@ def print_assigned_values(assigned: AssignedStateSDPDraft) -> None:
         )
 
 
-def print_draft(model: StateSDPDraft) -> None:
+def print_draft(model: StateSDPDraft | TopDownStateSDPDraft | PaperStateSDPDraft) -> None:
     """Print the SDP draft in a compact, inspection-oriented format."""
+    if isinstance(model, PaperStateSDPDraft):
+        print("Paper-Style Draft")
+        print(f"  inflation level: {model.inflation_level}")
+        print(f"  party dimensions: {model.party_dims}")
+        print()
+        print("Tau Variables")
+        for variable in model.psd_variables:
+            print(f"  {variable.name}: {' '.join(variable.lexorder)} shape=({variable.matrix_dim}, {variable.matrix_dim})")
+        print()
+        print("Observed Constraints")
+        for constraint in model.observed_constraints:
+            print(
+                "  "
+                f"{constraint.name}: "
+                f"{constraint.marginal_view.source_variable_name} -> "
+                f"{' '.join(constraint.target_lexorder)}"
+            )
+        print()
+        print("Matching Equalities")
+        for constraint in model.equality_constraints:
+            print(
+                "  "
+                f"{constraint.name}: "
+                f"{constraint.lhs_view.source_variable_name}({' '.join(constraint.lhs_view.occurrence_labels)})"
+                f" = "
+                f"{constraint.rhs_view.source_variable_name}({' '.join(constraint.rhs_view.occurrence_labels)})"
+            )
+        print()
+        print("PPT Constraints")
+        for candidate in model.ppt_constraints:
+            print(
+                "  "
+                f"{candidate.name}: PT({candidate.marginal_view.source_variable_name}"
+                f"({' '.join(candidate.marginal_view.occurrence_labels)})) "
+                f"transpose={' '.join(candidate.transpose_lexorder)} | "
+                f"complement={' '.join(candidate.complement_lexorder)}"
+            )
+        return
+
     print("Party dimensions")
     print(f"  {model.party_dims}")
     print()
@@ -2180,6 +3592,7 @@ def print_draft(model: StateSDPDraft) -> None:
 
 __all__ = [
     "AssignedStateSDPDraft",
+    "CrossInflationConstraintGroupDraft",
     "FusionSolveResult",
     "FusionStateSDPModel",
     "InternalSymmetryConstraintDraft",
@@ -2192,9 +3605,12 @@ __all__ = [
     "RepresentativeLinkDraft",
     "SharedMarginalRepresentativeDraft",
     "StateSDPDraft",
+    "TopDownStateSDPDraft",
     "build_fusion_feasibility_model",
     "build_legacy_fusion_feasibility_model",
+    "build_smaller_sdp_draft",
     "build_sdp_draft",
+    "build_top_down_sdp_draft",
     "partial_trace_einsum_spec",
     "partial_trace_named_einsum_spec",
     "partial_trace_recipe",
@@ -2205,4 +3621,5 @@ __all__ = [
     "set_values",
     "solve_fusion_feasibility",
     "solve_legacy_fusion_feasibility",
+    "validate_top_down_draft",
 ]
