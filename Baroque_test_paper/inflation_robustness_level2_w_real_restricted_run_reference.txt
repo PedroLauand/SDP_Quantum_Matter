@@ -1,0 +1,5 @@
+Model built: backend=scs-real-restricted, full_dim=64, ppt_auxiliaries=1, rows_total=12928, x_dim=6241, s_blocks=3
+problem_status=solved, solution_status=solved
+pOpt = 0.29982592
+tOpt = 0.70017408
+The state is non-network.

@@ -1,0 +1,32 @@
+Model built: backend=scs-real-restricted, full_dim=512, ppt_auxiliaries=2, rows_total=1494184, x_dim=656641, s_blocks=5
+------------------------------------------------------------------
+	       SCS v3.2.11 - Splitting Conic Solver
+	(c) Brendan O'Donoghue, Stanford University, 2012
+------------------------------------------------------------------
+problem:  variables n: 656641, constraints m: 1494184
+cones: 	  z: primal zero / dual free vars: 837543
+	  l: linear vars: 1
+	  s: psd vars: 656640, ssize: 5
+settings: eps_abs: 1.0e-04, eps_rel: 1.0e-04, eps_infeas: 1.0e-07
+	  alpha: 1.80, scale: 5.00e-01, adaptive_scale: 1
+	  max_iters: 100000, normalize: 1, rho_x: 1.00e-04
+	  acceleration_lookback: 20, acceleration_interval: 5
+lin-sys:  sparse-direct-amd-qdldl
+	  nnz(A): 2625793, nnz(P): 0
+------------------------------------------------------------------
+ iter | pri res | dua res |   gap   |   obj   |  scale  | time (s)
+------------------------------------------------------------------
+     0| 1.00e+00  8.09e-01  3.62e+00 -1.80e+00  5.00e-01  6.48e+00 
+   250| 7.84e-04  2.17e-05  4.27e-04 -6.17e-01  5.00e-01  7.88e+02 
+   500| 7.31e-04  1.26e-05  1.61e-04 -6.13e-01  5.00e-01  1.73e+03 
+   550| 1.56e-04  4.33e-05  2.01e-05 -6.12e-01  1.64e+00  1.89e+03 
+------------------------------------------------------------------
+status:  solved
+timings: total: 1.89e+03s = setup: 5.06e+00s + solve: 1.88e+03s
+	 lin-sys: 2.70e+02s, cones: 1.08e+03s, accel: 3.78e+02s
+------------------------------------------------------------------
+objective = -0.612420
+------------------------------------------------------------------
+problem_status=solved, solution_status=solved
+tMax = 0.61241032
+The state is non-network.

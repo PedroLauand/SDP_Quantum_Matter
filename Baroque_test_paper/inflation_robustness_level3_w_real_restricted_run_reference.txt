@@ -1,0 +1,38 @@
+Model built: backend=scs-real-restricted, full_dim=512, ppt_auxiliaries=2, rows_total=1494184, x_dim=656641, s_blocks=5
+------------------------------------------------------------------
+	       SCS v3.2.11 - Splitting Conic Solver
+	(c) Brendan O'Donoghue, Stanford University, 2012
+------------------------------------------------------------------
+problem:  variables n: 656641, constraints m: 1494184
+cones: 	  z: primal zero / dual free vars: 837543
+	  l: linear vars: 1
+	  s: psd vars: 656640, ssize: 5
+settings: eps_abs: 1.0e-04, eps_rel: 1.0e-04, eps_infeas: 1.0e-07
+	  alpha: 1.80, scale: 5.00e-01, adaptive_scale: 1
+	  max_iters: 100000, normalize: 1, rho_x: 1.00e-04
+	  acceleration_lookback: 20, acceleration_interval: 5
+lin-sys:  sparse-direct-amd-qdldl
+	  nnz(A): 2625793, nnz(P): 0
+------------------------------------------------------------------
+ iter | pri res | dua res |   gap   |   obj   |  scale  | time (s)
+------------------------------------------------------------------
+     0| 1.00e+00  8.04e-01  3.61e+00 -1.80e+00  5.00e-01  9.77e+00 
+   250| 2.99e-04  1.66e-04  2.75e-04 -6.71e-01  5.00e-01  5.77e+02 
+   500| 2.61e-04  2.31e-05  3.34e-04 -6.65e-01  5.00e-01  1.29e+03 
+   750| 2.87e-04  1.87e-05  2.82e-04 -6.62e-01  5.00e-01  1.98e+03 
+  1000| 9.80e-05  2.52e-05  2.60e-04 -6.60e-01  5.00e-01  2.48e+03 
+  1250| 8.62e-05  1.06e-05  2.30e-04 -6.59e-01  5.00e-01  2.93e+03 
+  1500| 8.20e-05  1.05e-05  2.10e-04 -6.58e-01  5.00e-01  3.26e+03 
+  1750| 8.35e-05  8.67e-06  1.85e-04 -6.57e-01  5.00e-01  3.58e+03 
+  2000| 8.29e-05  7.90e-06  1.73e-04 -6.56e-01  5.00e-01  3.91e+03 
+  2125| 8.29e-05  7.91e-06  1.61e-04 -6.56e-01  5.00e-01  4.07e+03 
+------------------------------------------------------------------
+status:  solved
+timings: total: 4.07e+03s = setup: 7.44e+00s + solve: 4.06e+03s
+	 lin-sys: 6.97e+02s, cones: 2.33e+03s, accel: 7.43e+02s
+------------------------------------------------------------------
+objective = -0.656200
+------------------------------------------------------------------
+problem_status=solved, solution_status=solved
+tMax = 0.65628038
+The state is non-network.
