@@ -51,17 +51,15 @@ The level-2 tripartite model uses two PSD variables:
 
 The optimization variable is `p`, with objective
 
-\[
-\min p
-\]
+```text
+min p
+```
 
 and observed anchor
 
-\[
-\operatorname{Tr}_{A22\,B22\,C22}(\sigma)
-=
-(1-p)\rho_{ABC} + p \frac{I}{D}.
-\]
+```text
+Tr_{A22 B22 C22}(sigma) = (1-p) rho_ABC + p I / D
+```
 
 Additional constraints:
 
@@ -87,18 +85,16 @@ The level-3 tripartite model uses three PSD variables:
 
 The optimization variable is `t`, with observed anchor
 
-\[
-\operatorname{Tr}_{A2\,B2\,C2\,A3\,B3\,C3}(\sigma)
-=
-t\rho_{ABC} + (1-t)\frac{I}{D}.
-\]
+```text
+Tr_{A2 B2 C2 A3 B3 C3}(sigma) = t rho_ABC + (1-t) I / D
+```
 
 Additional constraints:
 
 - `Tr(tau) = Tr(gamma) = Tr(sigma) = 1`
 - internal symmetries from the older MATLAB-style formulation
-- three `gamma \leftrightarrow tau` seven-party marginal equalities
-- three `tau \leftrightarrow sigma` seven-party marginal equalities
+- three `gamma <-> tau` seven-party marginal equalities
+- three `tau <-> sigma` seven-party marginal equalities
 
 Current PPT choice in the active code:
 
