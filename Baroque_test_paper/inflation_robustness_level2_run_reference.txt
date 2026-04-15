@@ -1,0 +1,5 @@
+Model built: backend=scs, full_dim=64, ppt_auxiliaries=1, rows_total=25412, x_dim=12289, cs_blocks=3
+problem_status=solved, solution_status=solved
+pOpt = 0.36788443
+tOpt = 0.63211557
+The state is non-network.

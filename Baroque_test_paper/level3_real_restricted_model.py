@@ -1,0 +1,436 @@
+"""Readable level-3 real-restricted robustness SDP.
+
+This file keeps the same older level-3 inflation constraints as the complex
+model, but every matrix variable is declared directly in the real-symmetric
+subspace.
+
+All low-level coordinate actions and SCS assembly details live in
+``level3_scs_backend.py``. What remains here is only the formulation.
+
+Slot convention for every 9-party matrix:
+
+    (A1, B1, C1, A2, B2, C2, A3, B3, C3)
+
+Inflated variables:
+
+- ``tau``   : three disconnected triangle copies
+- ``gamma`` : one triangle copy plus one disconnected 6-ring
+- ``sigma`` : one connected 9-ring
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from time import perf_counter
+
+import numpy as np
+import scipy.sparse as sp
+
+try:
+    from level3_scs_backend import (
+        DEFAULT_SCS_ACCELERATION_INTERVAL,
+        DEFAULT_SCS_ACCELERATION_LOOKBACK,
+        DEFAULT_SCS_ALPHA,
+        DEFAULT_SCS_RHO_X,
+        DEFAULT_SCS_SCALE,
+        MatrixVariableSpec,
+        SCSAffineConstraintBuilder,
+        SCSVectorSlice,
+        _validate_level3_inputs,
+        cached_real_symmetric_coordinate_action_for_slot_permutation,
+        cached_real_symmetric_partial_trace_coordinate_action,
+        cached_real_symmetric_partial_transpose_coordinate_action,
+        cached_real_symmetric_trace_coordinate_action,
+        cached_scs_real_symmetric_psd_coordinate_action,
+        compose_coordinate_actions,
+        ghz_density_matrix,
+        identity_coordinate_action,
+        pack_real_symmetric_coordinates,
+        solve_with_scs_compat,
+        unpack_real_symmetric_coordinates,
+    )
+except ModuleNotFoundError:
+    from Baroque_test_paper.level3_scs_backend import (
+        DEFAULT_SCS_ACCELERATION_INTERVAL,
+        DEFAULT_SCS_ACCELERATION_LOOKBACK,
+        DEFAULT_SCS_ALPHA,
+        DEFAULT_SCS_RHO_X,
+        DEFAULT_SCS_SCALE,
+        MatrixVariableSpec,
+        SCSAffineConstraintBuilder,
+        SCSVectorSlice,
+        _validate_level3_inputs,
+        cached_real_symmetric_coordinate_action_for_slot_permutation,
+        cached_real_symmetric_partial_trace_coordinate_action,
+        cached_real_symmetric_partial_transpose_coordinate_action,
+        cached_real_symmetric_trace_coordinate_action,
+        cached_scs_real_symmetric_psd_coordinate_action,
+        compose_coordinate_actions,
+        ghz_density_matrix,
+        identity_coordinate_action,
+        pack_real_symmetric_coordinates,
+        solve_with_scs_compat,
+        unpack_real_symmetric_coordinates,
+    )
+
+
+@dataclass
+class InflationRobustnessLevel3RealRestrictedSCSModel:
+    dims3: tuple[int, int, int]
+    dims9: tuple[int, ...]
+    D: int
+    full_dim: int
+    A: sp.csc_matrix
+    b: np.ndarray
+    c: np.ndarray
+    cone: dict[str, object]
+    t_slice: SCSVectorSlice
+    tau: MatrixVariableSpec
+    gamma: MatrixVariableSpec
+    sigma: MatrixVariableSpec
+    ppt_auxiliaries: dict[str, MatrixVariableSpec]
+    constraint_counts: dict[str, int]
+    build_profile: dict[str, object]
+
+
+# Slot order used everywhere in this file:
+#   0  1  2  3  4  5  6  7  8
+#   A1 B1 C1 A2 B2 C2 A3 B3 C3
+
+# Internal symmetries in the older formulation.
+TAU_SWAP12 = (3, 4, 5, 0, 1, 2, 6, 7, 8)
+GAMMA_ROTATE = (3, 4, 5, 6, 7, 8, 0, 1, 2)
+SIGMA_SWAP12 = (3, 4, 5, 0, 1, 2, 6, 7, 8)
+SIGMA_SWAP23 = (0, 1, 2, 6, 7, 8, 3, 4, 5)
+
+# Observed anchor:
+#   Tr_{A2 B2 C2 A3 B3 C3}(sigma) = t rho_ABC + (1 - t) I_ABC / D
+OBSERVED_ANCHOR_KEEP = (0, 1, 2)
+
+# Cross-inflation equalities between gamma and tau.
+EQ_GAMMA_TAU_0_GAMMA = (7, 8, 0, 1, 2, 4, 5)
+EQ_GAMMA_TAU_0_TAU = (4, 5, 0, 1, 2, 7, 8)
+EQ_GAMMA_TAU_1_GAMMA = (8, 0, 1, 2, 3, 5, 6)
+EQ_GAMMA_TAU_1_TAU = (5, 0, 1, 2, 3, 8, 6)
+EQ_GAMMA_TAU_2_GAMMA = (0, 1, 2, 3, 4, 6, 7)
+EQ_GAMMA_TAU_2_TAU = (0, 1, 2, 3, 4, 6, 7)
+
+# Cross-inflation equalities between tau and sigma.
+EQ_TAU_SIGMA_0_TAU = (0, 1, 3, 4, 6, 7, 8)
+EQ_TAU_SIGMA_0_SIGMA = (0, 1, 3, 4, 6, 7, 8)
+EQ_TAU_SIGMA_1_TAU = (1, 2, 4, 5, 6, 7, 8)
+EQ_TAU_SIGMA_1_SIGMA = (1, 2, 4, 5, 6, 7, 8)
+EQ_TAU_SIGMA_2_TAU = (2, 3, 5, 0, 6, 7, 8)
+EQ_TAU_SIGMA_2_SIGMA = (2, 0, 5, 3, 6, 7, 8)
+
+# Older 14-PPT layer.
+PPT_TAU_FULL_TRANSPOSE = (6, 7, 8)
+PPT_SIGMA_FULL_TRANSPOSE = (0, 1, 2)
+PPT_GAMMA_1V6_1_KEEP = (0, 2, 3, 4, 5, 6, 7)
+PPT_GAMMA_1V6_2_KEEP = (1, 3, 4, 5, 6, 7, 8)
+PPT_GAMMA_1V6_3_KEEP = (2, 4, 5, 6, 7, 8, 0)
+PPT_GAMMA_1V6_TRANSPOSE = (0,)
+PPT_GAMMA_3V4_1_KEEP = (0, 1, 2, 4, 5, 6, 7)
+PPT_GAMMA_3V4_2_KEEP = (1, 2, 3, 5, 6, 7, 8)
+PPT_GAMMA_3V4_3_KEEP = (2, 3, 4, 6, 7, 8, 0)
+PPT_GAMMA_3V4_TRANSPOSE = (0, 1, 2)
+PPT_TAU_1V6_1_KEEP = (0, 2, 3, 4, 6, 7, 8)
+PPT_TAU_1V6_2_KEEP = (1, 3, 4, 5, 6, 7, 8)
+PPT_TAU_1V6_3_KEEP = (2, 4, 5, 0, 6, 7, 8)
+PPT_TAU_1V6_TRANSPOSE = (0,)
+PPT_TAU_3V4_1_KEEP = (0, 2, 3, 4, 6, 7, 8)
+PPT_TAU_3V4_2_KEEP = (1, 3, 4, 5, 6, 7, 8)
+PPT_TAU_3V4_3_KEEP = (2, 4, 5, 0, 6, 7, 8)
+PPT_TAU_3V4_TRANSPOSE = (1, 2, 3)
+
+
+def _real_coord_dim(matrix_dim: int) -> int:
+    return int(matrix_dim * (matrix_dim + 1) // 2)
+
+
+def _extract_real_symmetric_variable_matrix(
+    x_values: np.ndarray,
+    variable_spec: MatrixVariableSpec,
+) -> np.ndarray:
+    coords = np.asarray(
+        x_values[variable_spec.x_slice.offset:variable_spec.x_slice.stop],
+        dtype=np.float64,
+    )
+    return unpack_real_symmetric_coordinates(coords, variable_spec.matrix_dim)
+
+
+def build_inflation_robustness_level3_real_restricted_scs_model(
+    rho: np.ndarray,
+    dims3: tuple[int, int, int],
+    *,
+    verbose: int = 1,
+    optimizer_max_time: float | None = None,
+) -> InflationRobustnessLevel3RealRestrictedSCSModel:
+    """Build the direct SCS cone program for the real-restricted level-3 SDP."""
+    del verbose, optimizer_max_time
+    dims3, dims9, D, full_dim, rho = _validate_level3_inputs(rho, dims3)
+    total_start = perf_counter()
+
+    builder = SCSAffineConstraintBuilder()
+
+    # Decision variable in the observed anchor:
+    #   Tr_rest(sigma) = t rho + (1 - t) I / D
+    t_slice = builder.add_scalar_variable("t")
+
+    # Main level-3 inflated states, restricted to the real-symmetric slice.
+    tau = builder.add_matrix_variable("tau", full_dim, _real_coord_dim(full_dim))
+    gamma = builder.add_matrix_variable("gamma", full_dim, _real_coord_dim(full_dim))
+    sigma = builder.add_matrix_variable("sigma", full_dim, _real_coord_dim(full_dim))
+
+    # PPT auxiliary matrices.
+    # Only the two full PPT constraints are active here.
+    # The reduced PPT constraints (3) through (14) are intentionally disabled.
+    ppt_tau_full = builder.add_matrix_variable("ppt_tau_full", full_dim, _real_coord_dim(full_dim))
+    ppt_sigma_full = builder.add_matrix_variable("ppt_sigma_full", full_dim, _real_coord_dim(full_dim))
+
+    ppt_auxiliaries = {
+        "ppt_tau_full": ppt_tau_full,
+        "ppt_sigma_full": ppt_sigma_full,
+    }
+
+    # 1) Trace-one constraints:
+    #   Tr(tau) = Tr(gamma) = Tr(sigma) = 1
+    full_trace_action = cached_real_symmetric_trace_coordinate_action(full_dim)
+    builder.add_trace_one(tau, full_trace_action)
+    builder.add_trace_one(gamma, full_trace_action)
+    builder.add_trace_one(sigma, full_trace_action)
+
+    # 2) Internal symmetries from the older formulation.
+    builder.add_difference_equality(
+        tau,
+        cached_real_symmetric_coordinate_action_for_slot_permutation(dims9, TAU_SWAP12),
+        tau,
+        identity_coordinate_action(tau.coord_dim),
+        counter_key="symmetry",
+    )
+    builder.add_difference_equality(
+        gamma,
+        cached_real_symmetric_coordinate_action_for_slot_permutation(dims9, GAMMA_ROTATE),
+        gamma,
+        identity_coordinate_action(gamma.coord_dim),
+        counter_key="symmetry",
+    )
+    builder.add_difference_equality(
+        sigma,
+        cached_real_symmetric_coordinate_action_for_slot_permutation(dims9, SIGMA_SWAP12),
+        sigma,
+        identity_coordinate_action(sigma.coord_dim),
+        counter_key="symmetry",
+    )
+    builder.add_difference_equality(
+        sigma,
+        cached_real_symmetric_coordinate_action_for_slot_permutation(dims9, SIGMA_SWAP23),
+        sigma,
+        identity_coordinate_action(sigma.coord_dim),
+        counter_key="symmetry",
+    )
+
+    # 3) Observed ABC anchor on sigma:
+    #   Tr_{A2 B2 C2 A3 B3 C3}(sigma) = t rho_ABC + (1 - t) I_ABC / D
+    rho_coord = pack_real_symmetric_coordinates(rho)
+    mixed_coord = pack_real_symmetric_coordinates(np.eye(D, dtype=np.float64) / float(D))
+    builder.add_observed_anchor(
+        sigma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, OBSERVED_ANCHOR_KEEP),
+        mixed_coord.astype(np.float64, copy=False),
+        t_slice,
+        (mixed_coord - rho_coord).astype(np.float64, copy=False),
+    )
+
+    # 4) Cross-inflation equalities between gamma and tau.
+    builder.add_difference_equality(
+        gamma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_GAMMA_TAU_0_GAMMA),
+        tau,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_GAMMA_TAU_0_TAU),
+        counter_key="equality",
+    )
+    builder.add_difference_equality(
+        gamma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_GAMMA_TAU_1_GAMMA),
+        tau,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_GAMMA_TAU_1_TAU),
+        counter_key="equality",
+    )
+    builder.add_difference_equality(
+        gamma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_GAMMA_TAU_2_GAMMA),
+        tau,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_GAMMA_TAU_2_TAU),
+        counter_key="equality",
+    )
+
+    # 5) Cross-inflation equalities between tau and sigma.
+    builder.add_difference_equality(
+        tau,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_TAU_SIGMA_0_TAU),
+        sigma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_TAU_SIGMA_0_SIGMA),
+        counter_key="equality",
+    )
+    builder.add_difference_equality(
+        tau,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_TAU_SIGMA_1_TAU),
+        sigma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_TAU_SIGMA_1_SIGMA),
+        counter_key="equality",
+    )
+    builder.add_difference_equality(
+        tau,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_TAU_SIGMA_2_TAU),
+        sigma,
+        cached_real_symmetric_partial_trace_coordinate_action(dims9, EQ_TAU_SIGMA_2_SIGMA),
+        counter_key="equality",
+    )
+
+    # 6) PPT family.
+    # Active:
+    #   1. ppt_tau_full   = PT_{A3 B3 C3}(tau)
+    #   2. ppt_sigma_full = PT_{A1 B1 C1}(sigma)
+    #
+    # Disabled here by request:
+    #   3-14. all reduced gamma/tau PPT constraints.
+    builder.add_auxiliary_link(
+        ppt_tau_full,
+        tau,
+        cached_real_symmetric_partial_transpose_coordinate_action(dims9, PPT_TAU_FULL_TRANSPOSE),
+    )
+    builder.add_auxiliary_link(
+        ppt_sigma_full,
+        sigma,
+        cached_real_symmetric_partial_transpose_coordinate_action(dims9, PPT_SIGMA_FULL_TRANSPOSE),
+    )
+
+    # 7) Scalar nonnegativity and PSD cone constraints.
+    zero_rows = int(builder.next_row)
+    builder.add_scalar_nonnegative(t_slice)
+
+    s_dims: list[int] = []
+    for variable_spec in (
+        tau,
+        gamma,
+        sigma,
+        ppt_tau_full,
+        ppt_sigma_full,
+    ):
+        builder.add_psd_constraint(
+            variable_spec,
+            cached_scs_real_symmetric_psd_coordinate_action(variable_spec.matrix_dim),
+        )
+        s_dims.append(int(variable_spec.matrix_dim))
+
+    cone = {"z": int(zero_rows), "l": 1, "s": s_dims}
+    A, b, c, constraint_counts = builder.finalize(objective_slice=t_slice, cone=cone)
+
+    build_profile = {
+        "total_build_time": perf_counter() - total_start,
+        "scope": {
+            "formulation": "real_restricted_scs",
+            "full_dim": full_dim,
+            "ppt_auxiliaries": len(ppt_auxiliaries),
+            "x_dim": int(c.size),
+            "cone_zero_rows": int(zero_rows),
+            "cone_linear_rows": 1,
+            "cone_s_dims": tuple(int(dim) for dim in s_dims),
+        },
+    }
+    return InflationRobustnessLevel3RealRestrictedSCSModel(
+        dims3=dims3,
+        dims9=dims9,
+        D=D,
+        full_dim=full_dim,
+        A=A,
+        b=b,
+        c=c,
+        cone=cone,
+        t_slice=t_slice,
+        tau=tau,
+        gamma=gamma,
+        sigma=sigma,
+        ppt_auxiliaries=ppt_auxiliaries,
+        constraint_counts=constraint_counts,
+        build_profile=build_profile,
+    )
+
+
+def solve_inflation_robustness_level3_real_restricted_scs(
+    rho: np.ndarray,
+    dims3: tuple[int, int, int],
+    *,
+    verbose: int = 1,
+    optimizer_max_time: float | None = None,
+    scs_max_iters: int = int(1e5),
+    scs_eps_abs: float = 1e-4,
+    scs_eps_rel: float = 1e-4,
+    scs_use_indirect: bool = False,
+    scs_alpha: float = DEFAULT_SCS_ALPHA,
+    scs_scale: float = DEFAULT_SCS_SCALE,
+    scs_normalize: bool = True,
+    scs_adaptive_scale: bool = True,
+    scs_rho_x: float = DEFAULT_SCS_RHO_X,
+    scs_acceleration_lookback: int = DEFAULT_SCS_ACCELERATION_LOOKBACK,
+    scs_acceleration_interval: int = DEFAULT_SCS_ACCELERATION_INTERVAL,
+) -> dict[str, object]:
+    built = build_inflation_robustness_level3_real_restricted_scs_model(
+        rho,
+        dims3,
+        verbose=verbose,
+        optimizer_max_time=optimizer_max_time,
+    )
+    solve_start = perf_counter()
+    solved = solve_with_scs_compat(
+        {
+            "P": sp.csc_matrix((built.c.size, built.c.size), dtype=np.float64),
+            "A": built.A,
+            "b": built.b,
+            "c": built.c,
+        },
+        built.cone,
+        verbose=bool(verbose),
+        max_iters=int(scs_max_iters),
+        eps_abs=float(scs_eps_abs),
+        eps_rel=float(scs_eps_rel),
+        alpha=float(scs_alpha),
+        scale=float(scs_scale),
+        normalize=bool(scs_normalize),
+        adaptive_scale=bool(scs_adaptive_scale),
+        rho_x=float(scs_rho_x),
+        acceleration_lookback=int(scs_acceleration_lookback),
+        acceleration_interval=int(scs_acceleration_interval),
+        time_limit_secs=0.0 if optimizer_max_time is None else float(optimizer_max_time),
+        use_indirect=bool(scs_use_indirect),
+    )
+    solve_seconds = perf_counter() - solve_start
+
+    info = dict(solved.get("info", {}))
+    x_values = solved.get("x")
+    if x_values is None:
+        t_value = float("nan")
+        tau_matrix = None
+        gamma_matrix = None
+        sigma_matrix = None
+    else:
+        x_values = np.asarray(x_values, dtype=np.float64).reshape(-1)
+        t_value = float(x_values[built.t_slice.offset])
+        tau_matrix = _extract_real_symmetric_variable_matrix(x_values, built.tau)
+        gamma_matrix = _extract_real_symmetric_variable_matrix(x_values, built.gamma)
+        sigma_matrix = _extract_real_symmetric_variable_matrix(x_values, built.sigma)
+
+    status = str(info.get("status", "unknown"))
+    return {
+        "problem_status": status,
+        "solution_status": status,
+        "t_value": t_value,
+        "tau_matrix": tau_matrix,
+        "gamma_matrix": gamma_matrix,
+        "sigma_matrix": sigma_matrix,
+        "solve_seconds": solve_seconds,
+        "constraint_counts": dict(built.constraint_counts),
+        "build_profile": dict(built.build_profile),
+        "solver_info": info,
+    }
